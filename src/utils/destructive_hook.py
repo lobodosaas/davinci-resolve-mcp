@@ -235,6 +235,7 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
     }),
     "timeline_item_fusion": frozenset({
         "add_comp",
+        "animate_transform",
         "delete_comp",
         "import_comp",
         "load_comp",
@@ -381,6 +382,7 @@ NATIVE_DRY_RUN_ACTIONS: frozenset = frozenset({
     ("timeline", "replace_source_range"),
     ("timeline", "split_item"),
     ("timeline", "copy_transition"),
+    ("timeline_item_fusion", "animate_transform"),
     ("timeline_ai", "create_subtitles"),
     ("timeline_ai", "set_subtitle_preset"),
     ("timeline_ai", "write_captions_live"),

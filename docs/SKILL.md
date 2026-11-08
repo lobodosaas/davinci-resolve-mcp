@@ -2023,7 +2023,13 @@ Key actions:
 
 Key actions: `add_comp`, `get_comp_count`, `get_comp_names`, `export_comp(path, index)`,
 `import_comp(path)`, `delete_comp(name)`, `load_comp(name)`, `rename_comp`,
-`get_cache_enabled`, `set_cache(value)` — value: `"Auto"`, `"On"`, `"Off"`
+`get_cache_enabled`, `set_cache(value)` — value: `"Auto"`, `"On"`, `"Off"`,
+`animate_transform(keyframes, new_comp?, dry_run?)` — keyframed Size / Center /
+Angle: inserts a Fusion Transform before `MediaOut1` (in the item's first comp,
+or a new one) and keys it; `keyframes` is `[{frame, size?, center?: [x, y],
+angle?}]` with `frame` relative to the item start and Center normalised
+(0.5, 0.5 = centre). Values are read back per key (`verified`). Being a Fusion
+comp, the animation survives `timeline(action="split_item")`.
 
 **`timeline_item_color`** — Color grading on timeline items. Requires Color page
 for most operations.

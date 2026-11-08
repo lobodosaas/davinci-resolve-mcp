@@ -261,6 +261,8 @@ class RiskClassificationHook(LifecycleHook):
         ("timeline_item_color", "reset_all_node_colors"),
         ("timeline_item_color", "rename_version"),
         ("timeline_item_fusion", "add_comp"),
+        # Adds (or edits) a Fusion comp: a keyframed Transform before MediaOut1.
+        ("timeline_item_fusion", "animate_transform"),
         ("timeline_item_fusion", "rename_comp"),
         ("timeline_item_takes", "add"),
         ("timeline_item_takes", "select"),

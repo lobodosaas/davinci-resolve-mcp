@@ -29994,6 +29994,9 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
       rename_comp(old_name, new_name, ...) -> {success}
       get_cache_enabled(...) -> {enabled}  — Fusion output cache status
       set_cache(value, ...) -> {success}  — value: "Auto", "On", or "Off"
+      animate_transform(keyframes=[{frame, size?, center?:[x,y], angle?}], new_comp?, dry_run?) -> {success, verified, readback, comp_added}
+        Keyframed transform via a Fusion Transform inserted before MediaOut1 (first comp, or a new one).
+        frame is relative to the item start; Center normalised (0.5,0.5 = centre); Angle in degrees.
 
     Default: track_type="video", track_index=1, item_index=0
     Or address the item by timeline_item_id (its GetUniqueId(), stable); on
@@ -30034,7 +30037,125 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
         return {"enabled": item.GetIsFusionOutputCacheEnabled()}
     elif action == "set_cache":
         return {"success": bool(item.SetFusionOutputCache(p["value"]))}
-    return _unknown(action, ["add_comp","get_comp_count","get_comp_names","get_comp_by_name","get_comp_by_index","export_comp","import_comp","delete_comp","load_comp","rename_comp","get_cache_enabled","set_cache"])
+    elif action == "animate_transform":
+        return _timeline_item_animate_transform(item, p)
+    return _unknown(action, ["add_comp","get_comp_count","get_comp_names","get_comp_by_name","get_comp_by_index","export_comp","import_comp","delete_comp","load_comp","rename_comp","get_cache_enabled","set_cache","animate_transform"])
+
+
+def _dry_run_requested(p: Dict[str, Any]) -> bool:
+    """Dry run, read exactly as the destructive hook reads it (dry_run / dryRun):
+    the hook skips the archive for a dry run, so the handler must not mutate on
+    any alias the hook accepts."""
+    return _explicit_bool_param(p, "dry_run", "dryRun") is True
+
+
+_ANIMATE_TRANSFORM_INPUTS = {"size": "Size", "angle": "Angle", "center": "Center"}
+
+
+def _timeline_item_animate_transform(item, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Keyframed Size / Center / Angle through a Fusion Transform on the item.
+
+    Measured on Studio 21.1.1: the item's comp renders 0..duration-1 (item
+    relative; any COMPN_RenderStart offset is added); a Transform inserted
+    between MediaOut1 and its upstream animates once its input holds a
+    BezierSpline (Size, Angle) or Path (Center) and SetInput(name, value, frame)
+    is called per key (it returns None but sets); GetInput(name, frame) reads
+    the values back. Uses the item's first comp, or adds one (new_comp=true
+    always adds). keyframes: [{frame, size?, center?: [x, y], angle?}], frame
+    relative to the item start; Center is normalised (0.5, 0.5 = centre).
+    """
+    keyframes = p.get("keyframes")
+    if not isinstance(keyframes, list) or not keyframes:
+        return _err("keyframes must be a non-empty list of {frame, size?, center?, angle?}",
+                    code="INVALID_KEYFRAMES", category="invalid_input")
+    try:
+        duration = int(item.GetDuration())
+    except Exception:
+        duration = None
+    rows: List[Dict[str, Any]] = []
+    for index, key in enumerate(keyframes):
+        where = f"keyframes[{index}]"
+        if not isinstance(key, dict) or type(key.get("frame")) is not int:
+            return _err(f"{where}.frame must be an integer", code="INVALID_KEYFRAMES", category="invalid_input")
+        frame = key["frame"]
+        if frame < 0 or (duration is not None and frame >= duration):
+            return _err(f"{where}.frame {frame} is outside the item (0..{(duration or 1) - 1})",
+                        code="INVALID_KEYFRAMES", category="invalid_input")
+        row: Dict[str, Any] = {"frame": frame}
+        for name, fusion_name in _ANIMATE_TRANSFORM_INPUTS.items():
+            if key.get(name) is None:
+                continue
+            value = key[name]
+            if name == "center":
+                if (not isinstance(value, (list, tuple)) or len(value) != 2
+                        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+                    return _err(f"{where}.center must be [x, y]", code="INVALID_KEYFRAMES", category="invalid_input")
+                row[fusion_name] = {1: float(value[0]), 2: float(value[1])}
+            else:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return _err(f"{where}.{name} must be a number", code="INVALID_KEYFRAMES", category="invalid_input")
+                if name == "size" and value <= 0:
+                    return _err(f"{where}.size must be > 0", code="INVALID_KEYFRAMES", category="invalid_input")
+                row[fusion_name] = float(value)
+        if len(row) == 1:
+            return _err(f"{where} sets none of size, center, angle", code="INVALID_KEYFRAMES",
+                        category="invalid_input")
+        rows.append(row)
+    properties = sorted({k for row in rows for k in row if k != "frame"})
+    plan = {"timeline_item_id": _safe_timeline_item_id(item), "properties": properties,
+            "keyframes": len(rows), "duration": duration}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+
+    try:
+        count = int(item.GetFusionCompCount() or 0)
+    except Exception:
+        count = 0
+    if count and not _coerce_bool(p.get("new_comp")):
+        comp, comp_added = item.GetFusionCompByIndex(1), False
+    else:
+        comp, comp_added = item.AddFusionComp(), True
+    if not comp:
+        return _err("Could not get or add a Fusion comp on the item", code="FUSION_COMP_FAILED",
+                    category="api_error")
+    media_out = comp.FindTool("MediaOut1")
+    if media_out is None:
+        return _err("The comp has no MediaOut1", code="FUSION_NO_MEDIA_OUT", category="api_error")
+    upstream = media_out.Input.GetConnectedOutput()
+    upstream_tool = upstream.GetTool() if upstream else comp.FindTool("MediaIn1")
+    if upstream_tool is None:
+        return _err("Nothing feeds MediaOut1 and there is no MediaIn1", code="FUSION_NO_INPUT",
+                    category="api_error")
+    transform = comp.AddTool("Transform", -32768, -32768)
+    if transform is None:
+        return _err("comp.AddTool('Transform') returned nothing", code="FUSION_ADD_TOOL_FAILED",
+                    category="api_error")
+    wired = bool(transform.ConnectInput("Input", upstream_tool)) and bool(media_out.ConnectInput("Input", transform))
+    try:
+        offset = int(round(float((comp.GetAttrs() or {}).get("COMPN_RenderStart") or 0)))
+    except Exception:
+        offset = 0
+    for name in properties:
+        setattr(transform, name, comp.Path() if name == "Center" else comp.BezierSpline())
+    for row in rows:
+        for name in properties:
+            if name in row:
+                transform.SetInput(name, row[name], row["frame"] + offset)
+
+    def _close(got, want):
+        if isinstance(want, dict):
+            return isinstance(got, dict) and all(abs(float(got.get(k, 1e9)) - v) < 1e-4 for k, v in want.items())
+        return isinstance(got, (int, float)) and abs(float(got) - want) < 1e-4
+
+    readback, verified = [], wired
+    for row in rows:
+        got = {name: _ser(transform.GetInput(name, row["frame"] + offset)) for name in properties if name in row}
+        ok = all(_close(transform.GetInput(name, row["frame"] + offset), row[name]) for name in got)
+        verified = verified and ok
+        readback.append({"frame": row["frame"], "values": got, "match": ok})
+    return {"success": verified, "verified": verified, "comp_added": comp_added,
+            "tool": getattr(transform, "Name", "Transform"), "upstream": getattr(upstream_tool, "Name", None),
+            "comp_frame_offset": offset, "readback": readback, "plan": plan}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
