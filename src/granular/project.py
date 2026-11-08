@@ -1,6 +1,7 @@
 """Project, render, cache, cloud, and project-property tools."""
 
 from src.granular.common import *  # noqa: F401,F403
+from src.utils import render_audio_codec
 from src.utils.bool_params import recognised_bool
 from src.utils.page_lock import restoring_page
 
@@ -1185,6 +1186,11 @@ def set_render_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
             ExportVideo false). A True return means the settings were taken, not
             that a render will succeed: verify job status and the output file
             after starting (see api_truth 'Project.StartRendering').
+            AudioCodec takes a friendly name ('aac') or a plugin id
+            ('<vendor>:<codec>'); 'aac' tries Resolve's native name, then an AAC
+            encoder plugin id (the native name is refused on Linux 21.1.1). The
+            codec actually taken is returned under audio_codec; read the job's
+            AudioCodec back after AddRenderJob.
     """
     if isinstance(settings, dict) and "UseUniqueFilenames" in settings:
         coerced = recognised_bool(settings["UseUniqueFilenames"])
@@ -1197,8 +1203,19 @@ def set_render_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     project = resolve.GetProjectManager().GetCurrentProject()
     if not project:
         return {"error": "No project currently open"}
-    result = project.SetRenderSettings(settings)
-    return {"success": bool(result)}
+    audio_codec = None
+    if isinstance(settings, dict) and settings.get("AudioCodec"):
+        settings = dict(settings)
+        audio_codec = str(settings.pop("AudioCodec"))
+    result = bool(project.SetRenderSettings(settings)) if settings else True
+    if audio_codec is None:
+        return {"success": result}
+    try:
+        fmt = (project.GetCurrentRenderFormatAndCodec() or {}).get("format")
+    except Exception:
+        fmt = None
+    audio = render_audio_codec.apply_audio_codec(project, fmt, audio_codec)
+    return {"success": result and bool(audio["applied"]), "audio_codec": audio}
 
 
 @mcp.tool()

@@ -53,6 +53,7 @@ from src.utils.resolve211_dctl import native_dctl_result
 from src.utils.resolve211_normalization import normalize_audio
 from src.utils import audio_levels as _audio_levels
 from src.utils import color_wheels as _color_wheels
+from src.utils import render_audio_codec as _render_audio_codec
 from src.utils.subtitle_live import set_subtitle_preset as _set_live_subtitle_preset
 from src.utils.subtitle_live import list_captions_live as _list_live_captions
 from src.utils.subtitle_live import write_captions_live as _write_live_captions
@@ -23251,7 +23252,17 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
     if not os.path.isdir(target_dir):
         return _err(f"target_dir does not exist: {target_dir}")
     if _coerce_bool(p.get("require_temp_target"), True) and not _render_temp_path_ok(target_dir):
-        return _err("target_dir must be under the system temp directory unless require_temp_target=False")
+        return _err(
+            "target_dir must be under the system temp directory unless require_temp_target=False",
+            code="TARGET_DIR_NOT_TEMP",
+            category="invalid_input",
+            retryable=False,
+            remediation=(
+                "Pass a target_dir under the system temp directory, or pass "
+                "require_temp_target=false to render into this folder deliberately."
+            ),
+            state={"target_dir": target_dir},
+        )
     settings = dict(p.get("settings") or {})
     settings.setdefault("TargetDir", target_dir)
     if p.get("custom_name"):
@@ -23261,9 +23272,14 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         return err
     if not validation["valid"]:
         return {"success": False, "validation": validation}
+    audio_codec = p.get("audio_codec") or validation["settings"].get("AudioCodec")
     if _coerce_bool(p.get("dry_run")):
-        return _ok(validation=validation, format=p.get("format"), codec=p.get("codec"))
-    settings = validation["settings"]  # coerced bool keys, see _coerce_render_bool_settings
+        return _ok(validation=validation, format=p.get("format"), codec=p.get("codec"),
+                   audio_codec=audio_codec)
+    settings = dict(validation["settings"])  # coerced bool keys, see _coerce_render_bool_settings
+    # AudioCodec is applied on its own after the other settings, through the
+    # friendly-name resolution (a refused 'aac' must not sink the whole batch).
+    settings.pop("AudioCodec", None)
     before = _render_settings_snapshot(proj)
     # Pin the base render state before layering explicit settings on top. Without
     # this the job inherits the Deliver page's loaded preset for every key the
@@ -23276,6 +23292,7 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         if err:
             return err
     format_success = None
+    format_id = None
     if p.get("format") and p.get("codec"):
         formats = _render_formats(proj)
         format_id = _render_format_id_from_formats(formats, p["format"])
@@ -23305,7 +23322,43 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
                 },
             )
     settings_success = bool(proj.SetRenderSettings(settings))
+    audio = None
+    if settings_success and audio_codec:
+        if not format_id:
+            try:
+                format_id = (proj.GetCurrentRenderFormatAndCodec() or {}).get("format")
+            except Exception:
+                format_id = None
+        audio = _render_audio_codec.apply_audio_codec(proj, format_id, str(audio_codec))
+        if not audio["applied"]:
+            return _err(
+                f"Resolve refused audio codec {audio_codec!r} for format {format_id!r}; "
+                "no render job was queued.",
+                code="AUDIO_CODEC_REJECTED",
+                category="invalid_input",
+                remediation=(
+                    "Use a codec from render(action='get_audio_codecs') for this format, or pass "
+                    "the encoder's plugin id ('<vendor>:<codec>') as audio_codec."
+                ),
+                state=audio,
+            )
     job_id = proj.AddRenderJob() if settings_success else None
+    if job_id and audio:
+        audio["job_audio_codec"] = _render_audio_codec.job_audio_codec(proj, job_id)
+        if audio["job_audio_codec"] != audio["applied"]:
+            try:
+                audio["job_deleted"] = bool(proj.DeleteRenderJob(job_id))
+            except Exception:
+                audio["job_deleted"] = False
+            return _err(
+                f"The queued job reports AudioCodec {audio['job_audio_codec']!r}, not "
+                f"{audio['applied']!r} (requested {audio_codec!r}); the job was removed.",
+                code="AUDIO_CODEC_NOT_APPLIED",
+                category="resolve_api_failed",
+                retryable=False,
+                remediation="Set the audio codec on the Deliver page, or pass the encoder's plugin id.",
+                state={**audio, "job_id": job_id},
+            )
     result = {
         "success": bool(job_id),
         "job_id": job_id,
@@ -23314,6 +23367,8 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         "before": before,
         "settings": settings,
     }
+    if audio:
+        result["audio_codec"] = audio
     if preset_pin:
         result["preset_pinned"] = preset_pin
     elif settings.get("ExportVideo") is True:
@@ -23730,7 +23785,13 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
       probe_render_settings() -> {format_and_codec, mode, settings, jobs, is_rendering}
       validate_render_settings(settings, require_temp_target?) -> {valid, errors, unknown_keys}
       safe_set_render_settings(settings, dry_run?, restore?, require_temp_target?) -> {success, diff}
-      prepare_render_job(target_dir, settings?, format?, codec?, custom_name?, from_preset?, dry_run?) -> {success, job_id}
+      prepare_render_job(target_dir, settings?, format?, codec?, audio_codec?, custom_name?, from_preset?, require_temp_target?=true, dry_run?) -> {success, job_id, audio_codec?}
+        audio_codec pins the job's audio codec (friendly 'aac' / 'flac' / 'lpcm', or a plugin id
+        '<vendor>:<codec>'); without it the job inherits the Deliver page codec (often FLAC).
+        'aac' tries Resolve's native name, then an AAC encoder plugin id; the job's AudioCodec is
+        read back and a mismatch fails (AUDIO_CODEC_NOT_APPLIED, job removed). There is no audio
+        bitrate render setting in the API. require_temp_target=false allows a target_dir outside
+        the system temp dir (refused with TARGET_DIR_NOT_TEMP otherwise).
         from_preset pins the base render state (LoadRenderPreset) before the
         explicit settings go on top. Without it the job inherits the Deliver
         page's loaded preset for every key not passed, which the API gives no
