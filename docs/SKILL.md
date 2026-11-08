@@ -1861,10 +1861,11 @@ helpers:
 - `probe_audio_track(track_index?)`
 - `probe_audio_item(track_type?, track_index?, item_index?)`
 - `safe_set_audio_properties(properties, restore?, dry_run?, track_type?, track_index?, item_index?)`
-  — Volume / Pan / EQ writes are not honoured by Resolve's API; a request for
-  any of them returns a `known_limitation` block with the workaround (bake gain
-  into a rendered copy, or apply a Fairlight preset). `AudioSyncOffset` writes
-  do work.
+  — on Resolve 21.1+ `AudioVolume` (dB) and `AudioPan` (-100..100) write and
+  are read back; `Volume` / `Pan` / EQ are not honoured (`Pan` is the video
+  transform) and return a `known_limitation` block with the workaround (bake
+  gain into a rendered copy, or apply a Fairlight preset). `AudioSyncOffset`
+  writes do work.
 - `audio_mix_capability_report(...)`
 - `voice_isolation_capabilities(track_index?, track_type?, item_index?)`
 - `audio_mapping_report(clip_ids?)`
@@ -2001,9 +2002,13 @@ Key actions:
 - `get_transform` / `set_transform(Pan?, Tilt?, ZoomX?, ZoomY?, RotationAngle?, ...)`
 - `get_crop` / `set_crop(CropLeft?, CropRight?, CropTop?, CropBottom?, ...)`
 - `get_composite` / `set_composite(Opacity?, CompositeMode?)`
-- `get_audio` / `set_audio(Volume?, Pan?, AudioSyncOffset?)` — Resolve ignores
-  Volume / Pan / EQ writes on audio (returns a `known_limitation` block); only
-  `AudioSyncOffset` / `AudioSyncOffsetIsManual` take effect
+- `get_audio` / `set_audio(AudioVolume?, AudioPan?, AudioSyncOffset?)` — Resolve
+  21.1+: `AudioVolume` in dB (clamped -100..+30) and `AudioPan` -100..100 are
+  written to the audio item (a video item writes its linked audio) and read
+  back; `Volume` / `Pan` are accepted as aliases. Before 21.1 there is no level
+  key and a `known_limitation` block is returned. The granular
+  `set_timeline_item_audio` keeps its linear `volume` (1.0 = unity, converted
+  to dB) and -1..1 `pan` (×100), and adds `volume_db`
 - `get_voice_isolation_state` / `set_voice_isolation_state(state)` — Resolve
   20.1+; audio timeline items only
 - `get_keyframes(property)`, `add_keyframe(property, frame, value)`,

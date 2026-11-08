@@ -51,6 +51,7 @@ from src.utils.resolve211_blanking import validate_blanking
 from src.utils.resolve211_alignment import auto_align
 from src.utils.resolve211_dctl import native_dctl_result
 from src.utils.resolve211_normalization import normalize_audio
+from src.utils import audio_levels as _audio_levels
 from src.utils.subtitle_live import set_subtitle_preset as _set_live_subtitle_preset
 from src.utils.subtitle_live import list_captions_live as _list_live_captions
 from src.utils.subtitle_live import write_captions_live as _write_live_captions
@@ -820,12 +821,13 @@ edits audio files with no Resolve open. Plan/measure offline, apply live.
 - Offline `audio`: split (silence/TC/intervals) / trim / convert (needs ffmpeg on
   PATH — GPL, not bundled). Align/loudness-measure not yet vendored.
 
-Timeline audio SetProperty for level/pan/EQ does not work — 'Volume'/'Gain'
-return false and 'Pan' writes the video transform, not the audio pan; the
-public API exposes no Fairlight faders or automation curves. safe_set_audio_properties
-and timeline_item set_audio return a `known_limitation` block pointing at the
-fix: bake the gain into a rendered copy of the source, or apply a saved
-Fairlight preset. Use fairlight for bus structure only. The offline audio ops
+Clip level and pan: on Resolve 21.1+ audio timeline items take 'AudioVolume'
+(dB) and 'AudioPan' (-100..100) — timeline_item set_audio writes them (a video
+item writes its linked audio) and reads them back. 'Volume' returns false and
+'Pan' is the video transform. Before 21.1, and on every build for EQ, track
+faders and automation, there is no API: set_audio / safe_set_audio_properties
+return a `known_limitation` block pointing at the fix — bake the gain into a
+rendered copy of the source, or apply a saved Fairlight preset. Use fairlight for bus structure only. The offline audio ops
 write NEW files to scratch, never over source (AGENTS.md).
 
 Depth: docs/kernels/audio-fairlight-kernel.md."""
@@ -10310,7 +10312,9 @@ _TIMELINE_AUDIO_KERNEL_ACTIONS = [
     "fairlight_boundary_report",
 ]
 
-_AUDIO_PROPERTY_KEYS = ["Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"]
+# AudioVolume (dB) / AudioPan (-100..100) are the 21.1 audio item keys; Volume and
+# Pan are kept for older builds (Volume returns False, Pan is the video transform).
+_AUDIO_PROPERTY_KEYS = ["AudioVolume", "AudioPan", "Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"]
 
 
 def _audio_capabilities():
@@ -10345,7 +10349,7 @@ def _audio_capabilities():
         "partially_supported": {
             "voice_isolation": "Track/item voice isolation depends on Resolve version, license, page state, and audio content.",
             "transcription_subtitles": "Transcription and subtitle generation can be asynchronous and may require installed AI components.",
-            "audio_property_writes": "Level/pan/EQ writes are not honoured: SetProperty('Volume'/'Gain') returns False and 'Pan' writes the video transform. AudioSyncOffset writes do work. safe_set_audio_properties returns a known_limitation block with the bake / Fairlight-preset workaround.",
+            "audio_property_writes": "Resolve 21.1+: clip level and pan write through 'AudioVolume' (dB) and 'AudioPan' (-100..100) on the audio item (timeline_item set_audio). 'Volume' returns False and 'Pan' is the video transform; before 21.1 there is no level/pan key, and EQ has none on any build. AudioSyncOffset writes do work. Failed level writes return a known_limitation block with the bake / Fairlight-preset workaround.",
             "auto_sync": "AutoSyncAudio depends on media content, channel layout, and selected sync settings.",
         },
         "unsupported": {
@@ -10437,7 +10441,7 @@ def _probe_audio_item(tl, p: Dict[str, Any]):
     return _timeline_item_audio_snapshot(item)
 
 
-_AUDIO_LEVEL_KEYS = {"Volume", "Level", "Gain", "AudioVolume", "Pan", "EQEnable", "EQEnabled"}
+_AUDIO_LEVEL_KEYS = {"Volume", "Level", "Gain", "AudioVolume", "AudioPan", "Pan", "EQEnable", "EQEnabled"}
 
 
 def _audio_write_limitation(written: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -10465,10 +10469,12 @@ def _audio_write_limitation(written: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "keys": hit,
         "reason": "no_api_write_path",
         "explanation": (
-            "Resolve's scripting API cannot set audio clip or track level, pan, "
-            "EQ, or automation. SetProperty writes the video transform only: "
-            "'Volume'/'Level'/'Gain' return False, and 'Pan' is the video "
-            "transform key so it returns True while the audio pan is unchanged."
+            "Resolve 21.1+ sets clip level and pan only through 'AudioVolume' "
+            "(dB) and 'AudioPan' (-100..100) on the audio item — use "
+            "timeline_item set_audio. 'Volume'/'Level'/'Gain' return False, and "
+            "'Pan' is the video transform key so it returns True while the audio "
+            "pan is unchanged. Before 21.1 there is no clip level/pan key, and "
+            "track faders, EQ and automation have no API on any build."
         ),
         "workarounds": [
             "Bake the level into a rendered copy of the source (ffmpeg "
@@ -10542,6 +10548,84 @@ def _safe_set_audio_properties(tl, p: Dict[str, Any]):
     )
     if limitation:
         out["known_limitation"] = limitation
+    return out
+
+
+def _timeline_item_get_audio(item) -> Dict[str, Any]:
+    """Audio level/pan of an item: its own 21.1 keys on an audio track, else its
+    linked audio items' (a video item carries no audio level)."""
+    targets = _audio_levels.audio_targets(item) or [item]
+    keys = [_audio_levels.AUDIO_VOLUME_KEY, _audio_levels.AUDIO_PAN_KEY,
+            "AudioSyncOffsetIsManual", "AudioSyncOffset"]
+
+    def _read(target):
+        row = {}
+        for key in keys:
+            try:
+                row[key] = target.GetProperty(key)
+            except Exception as exc:
+                row[key] = {"error": str(exc)}
+        return row
+
+    out = _read(targets[0])
+    if len(targets) > 1:
+        out["linked_audio"] = {str(_safe_timeline_item_id(t)): _read(t) for t in targets}
+    out["units"] = {"AudioVolume": "dB (-100..+30)", "AudioPan": "-100 left .. 100 right"}
+    return out
+
+
+def _timeline_item_set_audio(item, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Clip audio level and pan (Resolve 21.1+), with readback.
+
+    AudioVolume (dB) and AudioPan (-100..100) are the 21.1 audio item keys;
+    Volume / volume_db and Pan are accepted as aliases in the same units. A
+    video item writes its linked audio items: on a video item 'Pan' is the
+    picture transform. AudioSyncOffset* pass through to the item. Before 21.1
+    the level keys do not exist and a known_limitation block is returned.
+    """
+    def _pick(*names):
+        for name in names:
+            if p.get(name) is not None:
+                return p[name]
+        return None
+
+    volume = _pick("AudioVolume", "volume_db", "Volume")
+    pan = _pick("AudioPan", "Pan")
+    sync = {k: p[k] for k in ("AudioSyncOffsetIsManual", "AudioSyncOffset") if k in p}
+    if volume is None and pan is None and not sync:
+        return _err("Specify one or more of: AudioVolume (dB), AudioPan (-100..100), "
+                    "AudioSyncOffset, AudioSyncOffsetIsManual (Volume/Pan are aliases)")
+    out: Dict[str, Any] = {"success": True}
+    if sync:
+        out["sync"] = {k: bool(item.SetProperty(k, v)) for k, v in sync.items()}
+        out["success"] = all(out["sync"].values())
+    if volume is None and pan is None:
+        return out
+    try:
+        volume = None if volume is None else float(volume)
+        pan = None if pan is None else float(pan)
+    except (TypeError, ValueError):
+        return _err("AudioVolume and AudioPan must be numbers", code="INVALID_AUDIO_VALUE",
+                    category="invalid_input")
+    targets = _audio_levels.audio_targets(item)
+    if not targets:
+        return _err("The item has no audio: not on an audio track and no linked audio items",
+                    code="NO_AUDIO_ITEM", category="invalid_input")
+    if not all(_audio_levels.audio_level_api(t) for t in targets):
+        out["success"] = False
+        requested = {}
+        if volume is not None:
+            requested["AudioVolume"] = False
+        if pan is not None:
+            requested["AudioPan"] = False
+        out["known_limitation"] = _audio_write_limitation(requested)
+        return out
+    out["targets"] = []
+    for target in targets:
+        rows = _audio_levels.write_audio_levels(target, volume_db=volume, pan=pan)
+        out["targets"].append({"timeline_item_id": _safe_timeline_item_id(target), "results": rows})
+        if not all(r["verified"] for r in rows.values()):
+            out["success"] = False
     return out
 
 
@@ -29293,8 +29377,10 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       set_crop(CropLeft?, CropRight?, CropTop?, CropBottom?, CropSoftness?, CropRetain?, ...) -> {success}
       get_composite(...) -> {Opacity, CompositeMode}
       set_composite(Opacity?, CompositeMode?, ...) -> {success}
-      get_audio(...) -> {Volume, Pan, AudioSyncOffset, ...}
-      set_audio(Volume?, Pan?, ...) -> {success, known_limitation?}
+      get_audio(...) -> {AudioVolume, AudioPan, AudioSyncOffset, ..., linked_audio?}
+      set_audio(AudioVolume?|volume_db?|Volume?, AudioPan?|Pan?, AudioSyncOffset?, ...) -> {success, targets[{timeline_item_id, results}], known_limitation?}
+        Resolve 21.1+: AudioVolume in dB (clamped -100..+30), AudioPan -100 left..100 right, read back.
+        A video item writes its linked audio. Before 21.1 returns known_limitation.
         — Resolve ignores Volume/Pan/EQ writes on audio; those return a
           `known_limitation` block (bake gain into the media, or apply a
           Fairlight preset). AudioSyncOffset / AudioSyncOffsetIsManual do work.
@@ -29556,23 +29642,9 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
 
     # ── Audio ──
     elif action == "get_audio":
-        keys = ["Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"]
-        return {k: item.GetProperty(k) for k in keys}
+        return _timeline_item_get_audio(item)
     elif action == "set_audio":
-        valid = {"Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"}
-        results = {}
-        for k, v in p.items():
-            if k in valid:
-                results[k] = bool(item.SetProperty(k, v))
-        if not results:
-            return _err(f"Specify one or more of: {', '.join(sorted(valid))}")
-        out = _ok(**results)
-        # Volume/Pan writes go nowhere on audio (see _audio_write_limitation);
-        # AudioSyncOffset does work, so only flag when a level/pan key was asked.
-        limitation = _audio_write_limitation(results)
-        if limitation:
-            out["known_limitation"] = limitation
-        return out
+        return _timeline_item_set_audio(item, p)
 
     elif action == "probe_keyframe_override":
         proj, _, perr = _get_tl()

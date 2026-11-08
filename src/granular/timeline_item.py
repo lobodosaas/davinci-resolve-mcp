@@ -2,6 +2,7 @@
 
 from src.granular.common import *  # noqa: F401,F403
 from src.utils.clip_colors import clip_color_refusal
+from src.utils import audio_levels
 
 
 def _keyframe_api_missing(timeline_item, method_name):
@@ -177,8 +178,8 @@ def get_timeline_item_properties(timeline_item_id: str) -> Dict[str, Any]:
         # Audio-specific properties
         if _has_audio_type(timeline_item):
             properties["audio"] = {
-                "volume": timeline_item.GetProperty("Volume"),
-                "pan": timeline_item.GetProperty("Pan"),
+                "volume": timeline_item.GetProperty("AudioVolume"),  # dB, 21.1+
+                "pan": timeline_item.GetProperty("AudioPan"),  # -100..100, 21.1+
                 "eq_enabled": timeline_item.GetProperty("EQEnable"),
                 "normalize_enabled": timeline_item.GetProperty("NormalizeEnable"),
                 "normalize_level": timeline_item.GetProperty("NormalizeLevel")
@@ -635,14 +636,21 @@ def set_timeline_item_stabilization(timeline_item_id: str,
 def set_timeline_item_audio(timeline_item_id: str, 
                            volume: Optional[float] = None, 
                            pan: Optional[float] = None,
-                           eq_enabled: Optional[bool] = None) -> str:
-    """Set audio properties for a timeline item.
-    
+                           eq_enabled: Optional[bool] = None,
+                           volume_db: Optional[float] = None) -> str:
+    """Set the clip audio level and pan of a timeline item (Resolve 21.1+).
+
+    Writes the 21.1 audio item keys 'AudioVolume' (dB) and 'AudioPan'
+    (-100..100) and reads them back. A video item writes its linked audio.
+    Before 21.1 there is no audio level API and the tool says so.
+
     Args:
         timeline_item_id: The ID of the timeline item to modify
-        volume: Optional volume level (usually 0.0 to 2.0, where 1.0 is unity gain)
-        pan: Optional pan value (-1.0 to 1.0, where -1.0 is left, 0 is center, 1.0 is right)
-        eq_enabled: Optional boolean to enable/disable EQ
+        volume: Optional linear gain (1.0 = unity, 0.5 = -6.02 dB, 2.0 = +6.02 dB);
+            converted to dB. Resolve clamps the result to -100..+30 dB.
+        pan: Optional pan, -1.0 (left) .. 0 (centre) .. 1.0 (right); written as -100..100
+        eq_enabled: Optional EQ toggle (no API on any build; reported as not applied)
+        volume_db: Optional level in dB, written as is (overrides volume)
     """
     pm, current_project = get_current_project()
     if not current_project:
@@ -653,7 +661,7 @@ def set_timeline_item_audio(timeline_item_id: str,
         return "Error: No timeline currently active"
     
     # Validate inputs
-    if volume is None and pan is None and eq_enabled is None:
+    if volume is None and pan is None and eq_enabled is None and volume_db is None:
         return "Error: Must specify at least one parameter to modify"
     
     if volume is not None and volume < 0.0:
@@ -663,86 +671,56 @@ def set_timeline_item_audio(timeline_item_id: str,
         return "Error: Pan must be between -1.0 and 1.0"
     
     try:
-        # Find the timeline item by ID
-        video_track_count = current_timeline.GetTrackCount("video")
-        audio_track_count = current_timeline.GetTrackCount("audio")
-        
         timeline_item = None
-        is_audio = False
-        
-        # Search audio tracks first
-        for track_index in range(1, audio_track_count + 1):
-            items = current_timeline.GetItemListInTrack("audio", track_index)
-            if items:
-                for item in items:
+        for track_type in ("audio", "video"):
+            for track_index in range(1, (current_timeline.GetTrackCount(track_type) or 0) + 1):
+                for item in current_timeline.GetItemListInTrack(track_type, track_index) or []:
                     if str(item.GetUniqueId()) == timeline_item_id:
                         timeline_item = item
-                        is_audio = True
                         break
-            if timeline_item:
-                break
-        
-        # If not found in audio tracks, search video tracks (might be a video clip with audio)
-        if not timeline_item:
-            for track_index in range(1, video_track_count + 1):
-                items = current_timeline.GetItemListInTrack("video", track_index)
-                if items:
-                    for item in items:
-                        if str(item.GetUniqueId()) == timeline_item_id:
-                            timeline_item = item
-                            break
                 if timeline_item:
                     break
+            if timeline_item:
+                break
         
         if not timeline_item:
             return f"Error: Timeline item with ID '{timeline_item_id}' not found"
         
-        # Check if the item has audio capabilities
-        if not is_audio and not _has_audio_type(timeline_item):
-            return f"Error: Timeline item with ID '{timeline_item_id}' does not have audio properties"
+        targets = audio_levels.audio_targets(timeline_item)
+        if not targets:
+            return f"Error: Timeline item with ID '{timeline_item_id}' does not have audio properties (not on an audio track and no linked audio)"
         
-        success = True
-        
-        # Set volume if specified
-        if volume is not None:
-            result = timeline_item.SetProperty("Volume", volume)
-            if not result:
-                success = False
-        
-        # Set pan if specified
-        if pan is not None:
-            result = timeline_item.SetProperty("Pan", pan)
-            if not result:
-                success = False
-        
-        # Set EQ enabled if specified
+        level_db = volume_db if volume_db is not None else (
+            audio_levels.linear_to_db(volume) if volume is not None else None)
+        pan_value = audio_levels.unit_pan_to_percent(pan) if pan is not None else None
+        notes = []
         if eq_enabled is not None:
-            result = timeline_item.SetProperty("EQEnable", 1 if eq_enabled else 0)
-            if not result:
-                success = False
+            notes.append("EQ not applied: Resolve's scripting API has no clip EQ control")
+        if level_db is None and pan_value is None:
+            return f"Failed for timeline item '{timeline_item.GetName()}': " + "; ".join(notes)
         
-        if success:
-            changes = []
-            if volume is not None:
-                changes.append(f"volume to {volume}")
-            if pan is not None:
-                changes.append(f"pan to {pan}")
-            if eq_enabled is not None:
-                changes.append(f"EQ {'enabled' if eq_enabled else 'disabled'}")
-            
-            return f"Successfully set {' and '.join(changes)} for timeline item '{timeline_item.GetName()}'"
-        else:
+        if not all(audio_levels.audio_level_api(t) for t in targets):
             return (
                 f"Failed to set audio properties for timeline item "
-                f"'{timeline_item.GetName()}'. Resolve's scripting API has no "
-                "write path for audio level, pan, or EQ — SetProperty covers "
-                "the video transform only, so 'Volume'/'Gain' return False and "
-                "'Pan' moves the video transform, not the audio pan. Work "
-                "around it by baking the gain into a rendered copy of the "
-                "source (ffmpeg volume=NdB) and importing that, or (Resolve "
-                "20.2.2+) by saving a Fairlight preset in the UI and applying "
-                "it with project_settings apply_fairlight_preset."
+                f"'{timeline_item.GetName()}'. This Resolve build exposes no clip "
+                "audio level API: 'AudioVolume'/'AudioPan' arrived in Resolve 21.1, "
+                "and before it 'Volume' returns False and 'Pan' is the video "
+                "transform. Work around it by baking the gain into a rendered copy "
+                "of the source (ffmpeg volume=NdB) and importing that, or (Resolve "
+                "20.2.2+) by saving a Fairlight preset in the UI and applying it "
+                "with project_settings apply_fairlight_preset."
             )
+        
+        lines, ok = [], True
+        for target in targets:
+            rows = audio_levels.write_audio_levels(target, volume_db=level_db, pan=pan_value)
+            ok = ok and all(r["verified"] for r in rows.values())
+            lines.append(f"{target.GetUniqueId()}: " + ", ".join(
+                f"{k} requested {r['requested']:.2f} read back {r['readback']}" for k, r in rows.items()))
+        detail = "; ".join(lines + notes)
+        if ok:
+            return f"Successfully set audio on timeline item '{timeline_item.GetName()}' ({detail})"
+        return f"Failed to set audio exactly on timeline item '{timeline_item.GetName()}' ({detail})"
     except Exception as e:
         return f"Error setting timeline item audio properties: {str(e)}"
 
