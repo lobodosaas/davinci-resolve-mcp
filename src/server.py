@@ -4740,6 +4740,11 @@ _DUPLICATE_COPY_PROPERTY_KEYS = {
     ],
     "composite": ["Opacity", "CompositeMode"],
     "audio": [
+        # Resolve 21.1 timeline audio items expose AudioVolume (dB) / AudioPan
+        # (-100..100); the legacy Volume/Pan keys are refused there and kept
+        # only for older builds.
+        "AudioVolume",
+        "AudioPan",
         "Volume",
         "Pan",
         "AudioSyncOffsetIsManual",
@@ -6825,6 +6830,8 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
 
     def _carry(source, targets, key):
         if track_type != "video":
+            # Audio pieces keep the clip's level and pan (AudioVolume/AudioPan).
+            steps[key] = [{"properties": _copy_duplicate_item_state(source, t, ["audio"])} for t in targets]
             return
         steps[key] = [{"grades": _copy_grades_checked(source, t, resolve),
                        "properties": _copy_duplicate_item_state(source, t, list(_SLIP_COPY_GROUPS))}

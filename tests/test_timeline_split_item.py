@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 import src.server as s
+import src.server as s_mod
 
 
 class _Pool:
@@ -368,6 +369,24 @@ class SplitItemTest(unittest.TestCase):
         self.assertIn(("timeline", "split_item"), s._TOKEN_GATED_DESTRUCTIVE_ACTIONS)
         self.assertTrue(classify_operation_risk("timeline", "split_item", {}).to_dict()["recognised"])
         self.assertIn("split_item", s._timeline_edit_kernel_capabilities()["supported"]["clip_operations"])
+
+
+class SplitCarriesAudioLevelTest(SplitItemTest):
+    def test_linked_audio_pieces_keep_volume_and_pan(self):
+        proj, tl, mp, video, audio = self._fixture()
+        audio.props.update({"AudioVolume": -12.0, "AudioPan": -100.0})
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
+        self.assertTrue(out["verified"], out)
+        pieces = tl.tracks["audio"][1]
+        self.assertEqual(len(pieces), 2)
+        for piece in pieces:
+            self.assertEqual(piece.props.get("AudioVolume"), -12.0)
+            self.assertEqual(piece.props.get("AudioPan"), -100.0)
+
+    def test_duplicate_audio_group_uses_21_1_keys(self):
+        keys = s_mod._DUPLICATE_COPY_PROPERTY_KEYS["audio"]
+        self.assertIn("AudioVolume", keys)
+        self.assertIn("AudioPan", keys)
 
 
 if __name__ == "__main__":
