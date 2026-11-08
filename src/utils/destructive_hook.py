@@ -800,6 +800,61 @@ def _extract_analysis_run_id(params: Optional[Dict[str, Any]], project_root: Opt
     return timeline_versioning.new_analysis_run_id()
 
 
+def _archive_announcement(params: Optional[Dict[str, Any]]) -> Optional[str]:
+    """What the version-on-mutate hook will do to the current timeline, in
+    words, for a preview or plan. Read-only: predicts with the archive's own
+    naming logic and opens no run. None when there is no project context."""
+    ctx = _resolve_versioning_context()
+    if ctx is None:
+        return None
+    _resolve_h, project_h, project_root, _name = ctx
+    try:
+        tl = project_h.GetCurrentTimeline()
+        if tl is None:
+            return None
+        working = tl.GetName()
+        run_id = None
+        if isinstance(params, dict):
+            run_id = params.get("analysis_run_id") or params.get("run_id")
+        if not run_id:
+            try:
+                timeout = float(_read_preference("versioning_auto_run_idle_timeout_seconds", default=90))
+            except Exception:
+                timeout = 90.0
+            run_id = analysis_runs.peek_run_for_destructive(timeout)
+        existing = timeline_versioning.archived_name_for_run(project_root, working, run_id) if run_id else None
+        if existing:
+            return (f"already archived for run {run_id} as timeline '{existing}'; "
+                    "no new archive before changing")
+        name = timeline_versioning.predict_archive_name(project_h, project_root, tl)
+        return f"will create timeline '{name}' before changing" if name else None
+    except Exception as exc:
+        logger.debug("archive announcement skipped: %s", exc)
+        return None
+
+
+def _attach_archive_announcement(result: Any, params: Optional[Dict[str, Any]]) -> Any:
+    """Put the announcement in a confirm-token preview, else a plan, else top level."""
+    if not isinstance(result, dict):
+        return result
+    line = _archive_announcement(params)
+    if not line:
+        return result
+    for key in ("preview", "plan"):
+        if isinstance(result.get(key), dict):
+            result[key].setdefault("archive", line)
+            return result
+    result.setdefault("archive", line)
+    return result
+
+
+def _archives_timeline(tool_name: str, action: str) -> bool:
+    """A registered destructive action whose real call archives the timeline."""
+    return (action in DESTRUCTIVE_ACTIONS_BY_TOOL.get(tool_name, frozenset())
+            and tool_name not in NON_TIMELINE_WRITE_TOOLS
+            and tool_name != "media_pool")
+
+
 def _extract_initiator(params: Optional[Dict[str, Any]]) -> Optional[str]:
     """Provenance label for the row. Explicit param > current run initiator > None."""
     if isinstance(params, dict) and params.get("initiator"):
@@ -1253,7 +1308,12 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
                 )
 
             if not is_destructive(tool_name, action, params):
-                return fn(action, params, *args, **kwargs)
+                result = fn(action, params, *args, **kwargs)
+                if (_archives_timeline(tool_name, action)
+                        and _payload_is_plan_only(tool_name, action, params)):
+                    # A dry run: say what the real call will archive.
+                    result = _attach_archive_announcement(result, params)
+                return result
 
             operation_id = f"op_{uuid.uuid4().hex[:12]}"
             assessment = assess_action_risk(tool_name, action, params)
@@ -1315,6 +1375,9 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
                     will_gate = False
                 if will_gate:
                     result = fn(action, params, *args, **kwargs)
+                    if (isinstance(result, dict) and result.get("status") == "confirmation_required"
+                            and _archives_timeline(tool_name, action)):
+                        result = _attach_archive_announcement(result, params)
                     _audit_security_event(
                         operation_id=operation_id,
                         tool_name=tool_name,
@@ -1561,10 +1624,13 @@ def destructive_op(tool_name: str) -> Callable[[Callable[..., Any]], Callable[..
             # Annotate the result with versioning context so the caller (and the
             # control panel) can show what happened. Don't shadow existing keys.
             if isinstance(result, dict):
+                if archive_result.get("archived") and archive_result.get("archived_timeline_name"):
+                    result.setdefault("archive", {"created": archive_result["archived_timeline_name"]})
                 result.setdefault("_versioning", {
                     "analysis_run_id": run_id,
                     "archived": archive_result.get("archived"),
                     "archived_version": archive_result.get("version"),
+                    "archived_timeline_name": archive_result.get("archived_timeline_name"),
                     "metric": metric,
                     "before_value": before_value,
                     "after_value": after_value,

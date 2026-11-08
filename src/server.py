@@ -1397,6 +1397,8 @@ _TOKEN_GATED_DESTRUCTIVE_ACTIONS = frozenset({
     ("graph", "reset_all_grades"),
     # Batch grade carry-over from a color_trace plan: plan → confirm → apply.
     ("timeline_item_color", "apply_trace_plan"),
+    # Primary wheels into a new grade version: plan -> confirm -> apply.
+    ("timeline_item_color", "apply_wheels"),
     # 21.0 AI ops that render/generate NEW media files (additive, but expensive
     # and irreversible without manual cleanup) — gated so they never run by
     # surprise. They never modify source media.
@@ -28552,8 +28554,9 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
 
     PREFER probe_* / *_capabilities / *_boundary_report / *_checked / dry_run variants
     where they exist. Raw mutators are kept for advanced callers but bypass guardrails.
-    DESTRUCTIVE actions auto-archive the current timeline (C6); pass strict=true for
-    refuse-on-archive-failure behavior on the catastrophic ops. To thread several
+    DESTRUCTIVE actions auto-archive the current timeline (C6); the confirm preview and
+    dry-run plan name the archive (`archive`), the response reports `archive.created`.
+    Pass strict=true for refuse-on-archive-failure behavior on the catastrophic ops. To thread several
     destructive calls into ONE archived predecessor instead of N, wrap them in
     timeline_versioning begin_run/end_run.
 

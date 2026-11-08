@@ -208,6 +208,18 @@ def ensure_auto_run_for_destructive(
     return str(result["analysis_run_id"])
 
 
+def peek_run_for_destructive(idle_timeout_seconds: Optional[float] = None) -> Optional[str]:
+    """The run id ensure_auto_run_for_destructive would reuse right now, or
+    None when it would open a fresh run. Read-only: opens and closes nothing."""
+    timeout = float(idle_timeout_seconds if idle_timeout_seconds is not None else _DEFAULT_AUTO_RUN_IDLE_TIMEOUT_S)
+    with _LOCK:
+        active = _CURRENT_RUN["id"]
+        last = _LAST_DESTRUCTIVE_AT["epoch"]
+    if active and last and (time.time() - last) > timeout:
+        return None
+    return str(active) if active else None
+
+
 def bump_idle_timer() -> None:
     """Called by destructive_hook on every wrap entry within an active run."""
     with _LOCK:

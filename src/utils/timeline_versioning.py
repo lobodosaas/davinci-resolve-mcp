@@ -112,6 +112,51 @@ def _find_timeline_by_name(project: Any, name: str) -> Optional[Any]:
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
+def next_archive_version(project: Any, project_root: str, working_name: str) -> int:
+    """The version number the next archive of `working_name` will take."""
+    conn = timeline_brain_db.connect(project_root)
+    next_version = (timeline_brain_db.latest_version(conn, working_name) or 0) + 1
+    # The brain DB is not the only writer of archive names: other sessions,
+    # machines, or a crash between DuplicateTimeline and the version INSERT can
+    # leave `<name>_archived_vNN` timelines the DB has never heard of. A name
+    # collision makes DuplicateTimeline fail AND raises a blocking modal dialog
+    # in the Resolve UI, so bump past every suffix that exists in the project.
+    for existing_tl in _list_all_timelines(project):
+        try:
+            m = ARCHIVED_SUFFIX_PATTERN.match(existing_tl.GetName())
+        except Exception:
+            continue
+        if m and m.group("base") == working_name and m.group("v"):
+            next_version = max(next_version, int(m.group("v")) + 1)
+    return next_version
+
+
+def archive_name_for(working_name: str, version: int) -> str:
+    return f"{working_name}_archived_v{version:02d}"
+
+
+def predict_archive_name(project: Any, project_root: str, timeline: Any = None) -> Optional[str]:
+    """Name archive_current_timeline would give the archive now (read-only)."""
+    tl = timeline if timeline is not None else project.GetCurrentTimeline()
+    if tl is None:
+        return None
+    name = tl.GetName()
+    return archive_name_for(name, next_archive_version(project, project_root, name))
+
+
+def archived_name_for_run(project_root: str, timeline_name: str, analysis_run_id: str) -> Optional[str]:
+    """The archive this run already made of `timeline_name`, if any."""
+    if not analysis_run_id:
+        return None
+    conn = timeline_brain_db.connect(project_root)
+    row = conn.execute(
+        "SELECT archived_timeline_name FROM timeline_versions "
+        "WHERE timeline_name = ? AND analysis_run_id = ? ORDER BY version DESC LIMIT 1",
+        (timeline_name, analysis_run_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def archive_current_timeline(
     *,
     resolve: Any,
@@ -137,22 +182,8 @@ def archive_current_timeline(
         return {"success": False, "error": "Cannot access media pool"}
 
     working_name = tl.GetName()
-    conn = timeline_brain_db.connect(project_root)
-
-    next_version = (timeline_brain_db.latest_version(conn, working_name) or 0) + 1
-    # The brain DB is not the only writer of archive names: other sessions,
-    # machines, or a crash between DuplicateTimeline and the version INSERT can
-    # leave `<name>_archived_vNN` timelines the DB has never heard of. A name
-    # collision makes DuplicateTimeline fail AND raises a blocking modal dialog
-    # in the Resolve UI, so bump past every suffix that exists in the project.
-    for existing_tl in _list_all_timelines(project):
-        try:
-            m = ARCHIVED_SUFFIX_PATTERN.match(existing_tl.GetName())
-        except Exception:
-            continue
-        if m and m.group("base") == working_name and m.group("v"):
-            next_version = max(next_version, int(m.group("v")) + 1)
-    archived_name = f"{working_name}_archived_v{next_version:02d}"
+    next_version = next_archive_version(project, project_root, working_name)
+    archived_name = archive_name_for(working_name, next_version)
 
     # Resolve duplication must happen on the live timeline; pin current folder
     # to Archive bin first so the duplicate lands there directly.
