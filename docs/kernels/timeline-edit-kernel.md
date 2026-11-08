@@ -73,8 +73,14 @@ range lands nothing, so each item is rebuilt through a temporary track: pieces
 A and B are appended there with grade and properties carried, the original is
 deleted, the final pieces land on the original track and receive the grade and
 properties again, and the temporary track is removed. Video and audio are
-unlinked first and A/B are relinked after. Refused: a cut outside the item,
-retimed items, items with Fusion comps, locked tracks without `unlock_track`.
+unlinked first and A/B are relinked after. A constant speed is carried: each
+piece is appended with a source span equal to its record length and then
+`SetSpeed` rescales it, so piece B starts `(cut - start) * speed/100` source
+frames in (measured on 21.1.1: 48 frames at 50% from source 0, cut at +24, gives
+source 0-12 and 12-24, rendering identical to the original). Fusion comps are
+exported (`ExportFusionComp`, into `work_dir`, which must be Resolve-writable)
+before anything changes and imported into both final pieces. Refused: a cut
+outside the item, reversed or frozen items, locked tracks without `unlock_track`.
 A trim is a split followed by `lift_range` on the unwanted piece.
 
 ### Linked audio
@@ -170,10 +176,15 @@ Current partial areas:
 
 These are blocked by Resolve's public scripting API, not by MCP plumbing:
 
-- Transition cloning: no public timeline-item transition clone/read/write API.
+- Transition cloning: no clone verb, and a transition's type, category and
+  alignment are not readable. On 21.1+ `timeline(action="copy_transition")`
+  re-creates one: it reads the name and span, infers the alignment from the
+  span against its own cut (measured on 21.1.1: left ends at the cut, right
+  starts at it, centre straddles it, whichever side it was added from), and
+  calls `AddTransition` on the clip before (`before_item_id`) or after
+  (`after_item_id`) the target cut. Category defaults to `simple`.
 - Razor/split edits: no direct public timeline split primitive; `split_item`
-  emulates it by rebuild (retime, Inspector keyframes and Fusion comps are not
-  carried).
+  emulates it by rebuild (speed ramps and Inspector keyframes are not carried).
 - True partial lift: no direct partial-item delete; `split_item` then
   `lift_range` on the unwanted piece.
 - Source-less item cloning through append: titles, generators, Fusion

@@ -51,6 +51,8 @@ from src.utils.resolve211_blanking import validate_blanking
 from src.utils.resolve211_alignment import auto_align
 from src.utils.resolve211_dctl import native_dctl_result
 from src.utils.resolve211_normalization import normalize_audio
+from src.utils import audio_levels as _audio_levels
+from src.utils import color_wheels as _color_wheels
 from src.utils.subtitle_live import set_subtitle_preset as _set_live_subtitle_preset
 from src.utils.subtitle_live import list_captions_live as _list_live_captions
 from src.utils.subtitle_live import write_captions_live as _write_live_captions
@@ -820,12 +822,13 @@ edits audio files with no Resolve open. Plan/measure offline, apply live.
 - Offline `audio`: split (silence/TC/intervals) / trim / convert (needs ffmpeg on
   PATH — GPL, not bundled). Align/loudness-measure not yet vendored.
 
-Timeline audio SetProperty for level/pan/EQ does not work — 'Volume'/'Gain'
-return false and 'Pan' writes the video transform, not the audio pan; the
-public API exposes no Fairlight faders or automation curves. safe_set_audio_properties
-and timeline_item set_audio return a `known_limitation` block pointing at the
-fix: bake the gain into a rendered copy of the source, or apply a saved
-Fairlight preset. Use fairlight for bus structure only. The offline audio ops
+Clip level and pan: on Resolve 21.1+ audio timeline items take 'AudioVolume'
+(dB) and 'AudioPan' (-100..100) — timeline_item set_audio writes them (a video
+item writes its linked audio) and reads them back. 'Volume' returns false and
+'Pan' is the video transform. Before 21.1, and on every build for EQ, track
+faders and automation, there is no API: set_audio / safe_set_audio_properties
+return a `known_limitation` block pointing at the fix — bake the gain into a
+rendered copy of the source, or apply a saved Fairlight preset. Use fairlight for bus structure only. The offline audio ops
 write NEW files to scratch, never over source (AGENTS.md).
 
 Depth: docs/kernels/audio-fairlight-kernel.md."""
@@ -4737,6 +4740,11 @@ _DUPLICATE_COPY_PROPERTY_KEYS = {
     ],
     "composite": ["Opacity", "CompositeMode"],
     "audio": [
+        # Resolve 21.1 timeline audio items expose AudioVolume (dB) / AudioPan
+        # (-100..100); the legacy Volume/Pan keys are refused there and kept
+        # only for older builds.
+        "AudioVolume",
+        "AudioPan",
         "Volume",
         "Pan",
         "AudioSyncOffsetIsManual",
@@ -6771,13 +6779,21 @@ def _collect_timeline_items_in_range(tl, p: Dict[str, Any]):
     return start, end, items, None
 
 
-def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float, resolve=None):
+def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float, resolve=None,
+                       speed: float = 100.0, fusion_paths: Optional[List[str]] = None):
     """Rebuild one timeline item as two pieces cut at ``cut`` (absolute record frame).
 
     Same rebuild as replace_source_range, with two pieces: an AppendToTimeline onto an
     occupied record range lands nothing (measured on Studio 21.1.1), so the pieces go to
     a temporary track first, carry the grade and properties, the original goes, and the
     final pieces land on the original track. Returns (pieces [a, b] | None, steps, error).
+
+    Constant speed: the record length stays and the source advances at speed/100, so
+    piece B starts ``(cut - start) * speed/100`` source frames in. Each piece is appended
+    with a source span equal to its record length (so it lands at that length) and then
+    ``SetSpeed`` rescales its source — measured on 21.1.1, a 48-frame item at 50% from
+    source 0 cut at +24 gives source 0-12 and 12-24. ``fusion_paths`` (comps exported
+    from the original before it was deleted) are imported into both final pieces.
     """
     steps: Dict[str, Any] = {}
     info, _ = _timeline_item_track_info(item)
@@ -6787,9 +6803,11 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
     start, end = _frame_int(item.GetStart()), _frame_int(item.GetEnd())
     src0 = _timeline_item_source_start(item)
     media_type = 1 if track_type == "video" else 2
-    src_cut = src0 + int(round((cut - start) * ratio))
-    src_end = src0 + int(round((end - start) * ratio))
-    specs = [(start, src0, src_cut, cut - start), (cut, src_cut, src_end, end - cut)]
+    rate = float(speed) / 100.0
+    src_cut = src0 + int(round((cut - start) * rate * ratio))
+    # Source span = record length; SetSpeed then rescales the source (no-op at 100%).
+    specs = [(start, src0, src0 + int(round((cut - start) * ratio)), cut - start),
+             (cut, src_cut, src_cut + int(round((end - cut) * ratio)), end - cut)]
 
     def _place(track):
         pieces, attempts = [], []
@@ -6801,11 +6819,19 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
             attempts.append(attempt)
             if landed is None:
                 return pieces, attempts, False
+            if rate != 1.0:
+                try:
+                    attempt.append({"set_speed": bool(landed.SetSpeed({"Percentage": float(speed)})),
+                                    "start": _frame_int(landed.GetStart()), "end": _frame_int(landed.GetEnd())})
+                except Exception as exc:
+                    attempt.append({"set_speed": False, "error": f"SetSpeed failed: {exc}"})
             pieces.append(landed)
         return pieces, attempts, True
 
     def _carry(source, targets, key):
         if track_type != "video":
+            # Audio pieces keep the clip's level and pan (AudioVolume/AudioPan).
+            steps[key] = [{"properties": _copy_duplicate_item_state(source, t, ["audio"])} for t in targets]
             return
         steps[key] = [{"grades": _copy_grades_checked(source, t, resolve),
                        "properties": _copy_duplicate_item_state(source, t, list(_SLIP_COPY_GROUPS))}
@@ -6841,6 +6867,21 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
                                          "temp_item_ids": [_safe_timeline_item_id(t) for t in temps]}})
     _carry(temps[0], finals[:1], "to_final_a")
     _carry(temps[1], finals[1:], "to_final_b")
+    if fusion_paths:
+        steps["fusion"] = []
+        for piece in finals:
+            imported = []
+            for path in fusion_paths:
+                try:
+                    imported.append(bool(piece.ImportFusionComp(path)))
+                except Exception as exc:
+                    imported.append(f"ImportFusionComp failed: {exc}")
+            try:
+                count = int(piece.GetFusionCompCount() or 0)
+            except Exception:
+                count = None
+            steps["fusion"].append({"timeline_item_id": _safe_timeline_item_id(piece),
+                                    "imported": imported, "comp_count": count})
     steps["temp_removed"] = bool(_timeline_delete_clips_verified(tl, temps, False, resolve=resolve))
     steps["temp_track_removed"] = bool(tl.DeleteTrack(track_type, temp_index))
     return finals, steps, None
@@ -6856,9 +6897,10 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
 
     Params: timeline_item_id; the cut as ``frame`` (absolute record frame, as
     GetStart reports) or ``offset`` (frames from the item start); include_linked
-    (default true: cut linked audio too); unlock_track; dry_run; confirm_token.
-    Blocked: a cut outside the item, Fusion comps (not carried), retime (source
-    math would be wrong), locked tracks without unlock_track.
+    (default true: cut linked audio too); unlock_track; work_dir (where Fusion comps
+    are exported for the carry; must be Resolve-writable); dry_run; confirm_token.
+    Constant speed and Fusion comps are carried. Blocked: a cut outside the item,
+    reversed or frozen items (speed <= 0), locked tracks without unlock_track.
     """
     item_id = p.get("timeline_item_id") or p.get("timelineItemId") or p.get("clip_id")
     if not item_id:
@@ -6903,20 +6945,29 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     targets = [item] + linked
 
     blockers = []
+    speeds: Dict[int, float] = {}
+    comp_counts: Dict[int, int] = {}
     for target in targets:
         try:
             comps = int(target.GetFusionCompCount() or 0) if _has_method(target, "GetFusionCompCount") else 0
         except Exception:
             comps = 0
-        if comps:
-            blockers.append(f"{_safe_timeline_item_id(target)} carries {comps} Fusion comp(s), which the rebuild does not carry")
+        comp_counts[id(target)] = comps
         try:
             speed = target.GetSpeed() if _has_method(target, "GetSpeed") else None
         except Exception:
             speed = None
-        if isinstance(speed, dict) and speed.get("Percentage") not in (None, 100, 100.0):
-            blockers.append(f"{_safe_timeline_item_id(target)} is retimed ({speed.get('Percentage')}%), "
+        percent = speed.get("Percentage") if isinstance(speed, dict) else None
+        try:
+            percent = 100.0 if percent is None else float(percent)
+        except (TypeError, ValueError):
+            percent = None
+        if percent is None or percent <= 0:
+            blockers.append(f"{_safe_timeline_item_id(target)} is reversed or frozen "
+                            f"({speed.get('Percentage') if isinstance(speed, dict) else speed}%), "
                             "so the source frames of the pieces cannot be derived")
+        else:
+            speeds[id(target)] = percent
     tracks = _items_tracks(targets)
     locked = _timeline_locked_tracks(tl, tracks)
     unlock = _coerce_bool(p.get("unlock_track"))
@@ -6928,8 +6979,11 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         "pieces": {"a": {"start": start, "end": cut}, "b": {"start": cut, "end": end}},
         "linked_audio": [_safe_timeline_item_id(i) for i in linked],
         "left_unlinked": [_safe_timeline_item_id(i) for i in all_linked if i not in linked],
-        "carried": ["grades"] + list(_SLIP_COPY_GROUPS),
-        "not_carried": ["retime", "Inspector keyframes", "Fusion comps", "transitions", "audio levels"],
+        "carried": ["grades"] + list(_SLIP_COPY_GROUPS) + ["constant speed", "Fusion comps"],
+        "speed_percent": {_safe_timeline_item_id(t): speeds.get(id(t)) for t in targets},
+        "fusion_comps": {_safe_timeline_item_id(t): comp_counts[id(t)] for t in targets
+                         if comp_counts.get(id(t))},
+        "not_carried": ["speed ramps", "Inspector keyframes", "transitions", "audio levels"],
         "track_locked": locked,
         "blockers": blockers,
     }
@@ -6937,7 +6991,7 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         return _track_locked_refusal(locked, "split_item",
                                      extra_remediation="Or pass unlock_track=true: the tracks are unlocked "
                                                        "for the cut and locked again afterwards.")
-    if _coerce_bool(p.get("dry_run")):
+    if _dry_run_requested(p):
         return {"success": not blockers, "dry_run": True, "plan": plan}
     if blockers:
         return _err("; ".join(blockers), code="SPLIT_BLOCKED", category="precondition", state={"plan": plan})
@@ -6949,7 +7003,8 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
             action="timeline.split_item", params=p,
             preview={"operation": "timeline.split_item",
                      "warning": "Deletes the item (and linked audio) and re-appends it as two pieces; "
-                                "grade and sizing are carried, retime, keyframes and Fusion are not.",
+                                "grade, sizing, constant speed and Fusion comps are carried, speed "
+                                "ramps and keyframes are not.",
                      **plan})
     blocked = _consume_confirm_token(action="timeline.split_item", params=p)
     if blocked:
@@ -6960,9 +7015,34 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         return _err("Failed to get MediaPool")
     tl_fps, _fps_err = _timeline_fps(tl)
     report: Dict[str, Any] = {"plan": plan, "steps": {}}
+    # Fusion comps are exported before anything changes, so a failed export
+    # leaves the item untouched; they are imported into both final pieces.
+    fusion_paths: Dict[int, List[str]] = {}
+    if any(comp_counts.values()):
+        work_dir = p.get("work_dir") or _resolve_safe_dir(tempfile.gettempdir())
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+        except OSError as exc:
+            return _err(f"Cannot create work_dir {work_dir!r} for the Fusion comps: {exc}",
+                        code="SPLIT_FUSION_EXPORT_FAILED", category="io_error")
+        stamp = int(time.time() * 1000)
+        for target in targets:
+            for index in range(1, comp_counts.get(id(target), 0) + 1):
+                path = os.path.join(work_dir, f"split_{_safe_timeline_item_id(target)}_{stamp}_{index}.comp")
+                try:
+                    exported = bool(target.ExportFusionComp(path, index))
+                except Exception as exc:
+                    exported, path = False, f"{path} ({exc})"
+                if not exported:
+                    return _err(f"ExportFusionComp failed for comp {index} ({path}); nothing was changed. "
+                                "Pass work_dir under a folder Resolve can write.",
+                                code="SPLIT_FUSION_EXPORT_FAILED", category="api_error")
+                fusion_paths.setdefault(id(target), []).append(path)
+        report["fusion_exports"] = [x for v in fusion_paths.values() for x in v]
     unlocked = []
     page_guard = _edit_page_for_timeline_edits(resolve) if resolve is not None else contextlib.nullcontext()
     pieces: Dict[str, List[Any]] = {}
+    fusion_want: Dict[str, int] = {}
     try:
         with page_guard:
             for name in locked:
@@ -6981,8 +7061,11 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
                 media_fps = _media_item_source_fps(_timeline_item_media_pool_item(target))
                 ratio = (media_fps / tl_fps) if (tl_fps and media_fps) else 1.0
                 key = f"{t_info[0]}:{t_info[1]}"
+                if comp_counts.get(id(target)):
+                    fusion_want[key] = comp_counts[id(target)]
                 done, report["steps"][key], err = _split_rebuild_one(
-                    mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve)
+                    mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve,
+                    speed=speeds.get(id(target), 100.0), fusion_paths=fusion_paths.get(id(target)))
                 if err:
                     if pieces:
                         err.setdefault("error", {}).setdefault("state", {})["already_split"] = {
@@ -7004,6 +7087,9 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     expected = [(start, cut), (cut, end)]
     verified = all(
         [(_frame_int(x.GetStart()), _frame_int(x.GetEnd())) for x in v] == expected for v in pieces.values())
+    for key, want in fusion_want.items():
+        rows = report["steps"].get(key, {}).get("fusion", [])
+        verified = verified and len(rows) == 2 and all(r.get("comp_count") == want for r in rows)
     main = pieces[f"{track_info[0]}:{track_info[1]}"]
 
     def _summary(piece):
@@ -7018,6 +7104,408 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         "linked_pieces": {k: [_summary(x) for x in v] for k, v in pieces.items() if k != f"{track_info[0]}:{track_info[1]}"},
         **report,
     }
+
+
+def _is_transition_item(item) -> bool:
+    """A transition reports GetType()=='transition' on 21.1; older builds are told
+    apart by an empty GetProperty() (api_truth 'Transition create / copy / clone')."""
+    try:
+        if str(item.GetType()).lower() == "transition":
+            return True
+    except Exception:
+        pass
+    try:
+        return item.GetProperty() == {}
+    except Exception:
+        return False
+
+
+def _transition_alignment(start: int, end: int, cut: int) -> str:
+    """Measured on 21.1.1: left ends at the cut, right starts at it, centre straddles."""
+    if end == cut:
+        return "left"
+    if start == cut:
+        return "right"
+    return "center"
+
+
+def _track_clips_and_transitions(tl, track_type: str, track_index: int):
+    items = list(tl.GetItemListInTrack(track_type, track_index) or [])
+    trans = [i for i in items if _is_transition_item(i)]
+    clips = [i for i in items if i not in trans]
+    return clips, trans
+
+
+def _timeline_copy_transition_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a transition onto another cut (Resolve 21.1 AddTransition).
+
+    Resolve cannot clone a transition or read its type/alignment back: only the
+    name and frame range are readable. The copy takes the name (or ``type``),
+    the duration (end - start), the alignment inferred from the span against
+    its own cut, and ``category`` (default "simple"; unreadable on the source),
+    and adds it at the target cut named by ``before_item_id`` (the outgoing
+    clip: position "end") or ``after_item_id`` (the incoming clip: position
+    "start"). The new transition is read back and must match name, duration
+    and alignment.
+    """
+    src_id = p.get("transition_id") or p.get("source_transition_id")
+    if not src_id:
+        return _err("copy_transition requires transition_id", code="MISSING_TRANSITION_ID",
+                    category="invalid_input")
+    src = _find_timeline_item_by_id(tl, src_id)
+    if src is None:
+        return _err(f"No timeline item with id {src_id!r}", code="ITEM_NOT_FOUND", category="invalid_input")
+    if not _is_transition_item(src):
+        return _err(f"{src_id!r} is not a transition", code="NOT_A_TRANSITION", category="invalid_input")
+    src_info, info_err = _timeline_item_track_info(src)
+    if info_err:
+        return info_err
+    s_start, s_end = _frame_int(src.GetStart()), _frame_int(src.GetEnd())
+    clips, _ = _track_clips_and_transitions(tl, src_info[0], src_info[1])
+    src_cut = next((_frame_int(c.GetEnd()) for c in clips
+                    if s_start <= _frame_int(c.GetEnd()) <= s_end
+                    and any(_frame_int(o.GetStart()) == _frame_int(c.GetEnd()) for o in clips)), None)
+    if src_cut is None:
+        return _err("Could not find the cut under the source transition", code="SOURCE_CUT_NOT_FOUND",
+                    category="api_error")
+    name = p.get("type") or src.GetName()
+    if not name:
+        return _err("The source transition has no readable name (audio cross-fades read empty); pass type",
+                    code="TRANSITION_TYPE_UNKNOWN", category="invalid_input")
+    duration = s_end - s_start
+    alignment = _transition_alignment(s_start, s_end, src_cut)
+    category = p.get("category") or ("audio" if src_info[0] == "audio" else "simple")
+
+    before_id, after_id = p.get("before_item_id"), p.get("after_item_id")
+    if bool(before_id) == bool(after_id):
+        return _err("Pass exactly one of before_item_id (outgoing clip) or after_item_id (incoming clip)",
+                    code="MISSING_TARGET", category="invalid_input")
+    target = _find_timeline_item_by_id(tl, before_id or after_id)
+    if target is None:
+        return _err(f"No timeline item with id {before_id or after_id!r}", code="ITEM_NOT_FOUND",
+                    category="invalid_input")
+    t_info, info_err = _timeline_item_track_info(target)
+    if info_err:
+        return info_err
+    t_clips, t_trans = _track_clips_and_transitions(tl, t_info[0], t_info[1])
+    if before_id:
+        cut, position = _frame_int(target.GetEnd()), "end"
+        neighbour = any(_frame_int(c.GetStart()) == cut for c in t_clips if c is not target)
+    else:
+        cut, position = _frame_int(target.GetStart()), "start"
+        neighbour = any(_frame_int(c.GetEnd()) == cut for c in t_clips if c is not target)
+    if not neighbour:
+        return _err(f"No abutting clip at frame {cut} on {t_info[0]} track {t_info[1]}: not a cut",
+                    code="NO_CUT", category="invalid_input")
+    if any(_frame_int(t.GetStart()) <= cut <= _frame_int(t.GetEnd()) for t in t_trans):
+        return _err(f"The cut at {cut} already has a transition", code="TRANSITION_EXISTS",
+                    category="precondition")
+    options = {"type": name, "category": category, "position": position,
+               "alignment": alignment, "duration": duration}
+    error = validate_transition_options(options)
+    if error:
+        return _err(error, code="INVALID_TRANSITION_OPTIONS", category="invalid_input")
+    plan = {"source": {"transition_id": str(src_id), "name": src.GetName(), "start": s_start,
+                       "end": s_end, "cut": src_cut},
+            "target_cut": cut, "track": f"{t_info[0]}:{t_info[1]}", "options": options,
+            "category_note": "category is not readable from a transition; pass category to override"}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+    missing = _requires_method(target, "AddTransition", "21.1")
+    if missing:
+        return missing
+    result = transition_result(target.AddTransition(dict(options)))
+    _, after = _track_clips_and_transitions(tl, t_info[0], t_info[1])
+    landed = next((t for t in after if _frame_int(t.GetStart()) <= cut <= _frame_int(t.GetEnd())), None)
+    if landed is None:
+        return _err("AddTransition placed nothing at the target cut (the clips may lack handles)",
+                    code="TRANSITION_NOT_ADDED", category="api_error", state={"plan": plan, "native": result})
+    got = {"timeline_item_id": _safe_timeline_item_id(landed), "name": landed.GetName(),
+           "start": _frame_int(landed.GetStart()), "end": _frame_int(landed.GetEnd())}
+    got["duration"] = got["end"] - got["start"]
+    got["alignment"] = _transition_alignment(got["start"], got["end"], cut)
+    verified = got["name"] == name and got["duration"] == duration and got["alignment"] == alignment
+    return {"success": True, "verified": verified, "transition": got, "plan": plan}
+
+
+_CAPTION_FOLDER = "MCP Captions"
+_CAPTION_SKIP_WORDS = {"(...)", "...", ""}
+
+
+def _caption_tc_frames(tc: Any, fps: float) -> Optional[int]:
+    """HH:MM:SS:FF (transcription word timecode) to a frame count."""
+    try:
+        h, m, sec, f = (int(x) for x in str(tc).replace(";", ":").split(":"))
+    except (TypeError, ValueError):
+        return None
+    return int(round((h * 3600 + m * 60 + sec) * fps)) + f
+
+
+def _captions_from_transcription(clip, max_words: int, record_offset: float):
+    """Short captions [{start, end, text}] (seconds on the timeline) from a clip's
+    word-level transcription. Word timecodes are clip-relative (measured on
+    21.1.1: the first word of a 0-TC clip at 00:00:00:03); a clip whose Start TC
+    is not zero has it subtracted when the words sit past it. Filler tokens
+    such as "(...)" are dropped; a pause of more than 1 s also ends a caption."""
+    data = clip.GetTranscription() if _has_method(clip, "GetTranscription") else None
+    if not isinstance(data, dict) or not data.get("segments"):
+        return None, _err("The clip has no transcription; run media_pool_item transcribe_audio first",
+                          code="NO_TRANSCRIPTION", category="precondition")
+    match = re.search(r"\d+(?:\.\d+)?", str(clip.GetClipProperty("FPS") or ""))
+    fps = float(match.group(0)) if match else 24.0
+    tc0 = _caption_tc_frames(clip.GetClipProperty("Start TC") or "00:00:00:00", fps) or 0
+    words = []
+    for segment in data.get("segments") or []:
+        for word in segment.get("words") or []:
+            text = str(word.get("text") or "").strip()
+            a, b = _caption_tc_frames(word.get("start"), fps), _caption_tc_frames(word.get("end"), fps)
+            if text in _CAPTION_SKIP_WORDS or a is None or b is None:
+                continue
+            words.append((a, b, text))
+    if tc0 and words and min(w[0] for w in words) >= tc0:
+        words = [(a - tc0, b - tc0, t) for a, b, t in words]
+    captions, chunk = [], []
+
+    def _flush():
+        if chunk:
+            captions.append({"start": record_offset + chunk[0][0] / fps,
+                             "end": record_offset + chunk[-1][1] / fps,
+                             "text": " ".join(w[2] for w in chunk)})
+            chunk.clear()
+
+    for word in words:
+        if chunk and (len(chunk) >= max_words or word[0] - chunk[-1][1] > fps):
+            _flush()
+        chunk.append(word)
+    _flush()
+    if not captions:
+        return None, _err("The transcription has no words", code="NO_TRANSCRIPTION", category="precondition")
+    return captions, None
+
+
+def _caption_text_tool(inner_tl):
+    """The TextPlus tool of the title on V1 of a caption's inner timeline."""
+    items = inner_tl.GetItemListInTrack("video", 1) or []
+    if not items:
+        return None
+    comp = items[0].GetFusionCompByIndex(1)
+    tools = list((comp.GetToolList(False, "TextPlus") or {}).values()) if comp else []
+    return tools[0] if tools else None
+
+
+def _caption_style_inputs(style: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    if not style:
+        return {}, None
+    if not isinstance(style, dict):
+        return {}, _err("style must be an object {font?, size?, color?, position?}",
+                        code="INVALID_STYLE", category="invalid_input")
+    inputs: Dict[str, Any] = {}
+    if style.get("font"):
+        inputs["Font"] = str(style["font"])
+    if style.get("size") is not None:
+        inputs["Size"] = float(style["size"])
+    color = style.get("color")
+    if color is not None:
+        if not isinstance(color, (list, tuple)) or len(color) != 3:
+            return {}, _err("style.color must be [r, g, b] in 0-1", code="INVALID_STYLE", category="invalid_input")
+        inputs.update({"Red1": float(color[0]), "Green1": float(color[1]), "Blue1": float(color[2])})
+    position = style.get("position", style.get("vertical_position"))
+    if position is not None:
+        inputs["Center"] = {1: 0.5, 2: float(position)}
+    return inputs, None
+
+
+def _timeline_add_captions_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
+    """Burned-in style captions as Text+ titles on a chosen video track.
+
+    InsertFusionTitleIntoTimeline only lands on V1 of the current timeline (no
+    track selector; a locked V1 makes it fail — api_truth). So each caption is a
+    Text+ inside its own timeline in the Media Pool folder "MCP Captions"; that
+    timeline's Media Pool item is appended onto the caption track at the
+    caption's record frame (startFrame 0, endFrame = duration; measured on
+    21.1.1 to land exactly). The title is 5 s by default, so a longer caption is
+    cut into consecutive pieces of the same inner timeline. The user's current
+    timeline and Media Pool folder are restored.
+
+    Params: segments [{start, end, text}] in seconds from the timeline start, OR
+    clip_id of a transcribed Media Pool clip (+ record_offset seconds, max_words
+    default 3); track_index (default: a new video track above the highest);
+    style {font, size, color [r,g,b] 0-1, position (vertical, 0-1)}; dry_run.
+    """
+    max_words = p.get("max_words", 3)
+    if type(max_words) is not int or max_words < 1:
+        return _err("max_words must be a positive integer", code="INVALID_MAX_WORDS", category="invalid_input")
+    fps, fps_err = _timeline_fps(tl)
+    if fps_err:
+        return fps_err
+    mp = proj.GetMediaPool()
+    if p.get("segments") is not None:
+        segments = p["segments"]
+        if not isinstance(segments, list) or not segments:
+            return _err("segments must be a non-empty list of {start, end, text}",
+                        code="INVALID_SEGMENTS", category="invalid_input")
+    elif p.get("clip_id"):
+        clip = _find_clip(mp.GetRootFolder(), p["clip_id"])
+        if clip is None:
+            return _err(f"No Media Pool clip {p['clip_id']!r}", code="CLIP_NOT_FOUND", category="invalid_input")
+        try:
+            offset = float(p.get("record_offset") or 0)
+        except (TypeError, ValueError):
+            return _err("record_offset must be seconds", code="INVALID_SEGMENTS", category="invalid_input")
+        segments, err = _captions_from_transcription(clip, max_words, offset)
+        if err:
+            return err
+    else:
+        return _err("Pass segments or clip_id (a transcribed Media Pool clip)",
+                    code="MISSING_CAPTIONS", category="invalid_input")
+
+    start0 = _frame_int(tl.GetStartFrame())
+    captions, last_end = [], None
+    for index, seg in enumerate(segments):
+        where = f"segments[{index}]"
+        if not isinstance(seg, dict) or not str(seg.get("text") or "").strip():
+            return _err(f"{where} needs non-empty text", code="INVALID_SEGMENTS", category="invalid_input")
+        try:
+            a, b = float(seg["start"]), float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            return _err(f"{where} needs numeric start and end (seconds)", code="INVALID_SEGMENTS",
+                        category="invalid_input")
+        fa, fb = int(round(a * fps)), int(round(b * fps))
+        if a < 0 or fb <= fa:
+            return _err(f"{where}: start must be >= 0 and end after start", code="INVALID_SEGMENTS",
+                        category="invalid_input")
+        if last_end is not None and fa < last_end:
+            return _err(f"{where} overlaps the previous caption", code="INVALID_SEGMENTS",
+                        category="invalid_input")
+        last_end = fb
+        captions.append({"index": index, "text": str(seg["text"]).strip(), "start": a, "end": b,
+                         "record_start": start0 + fa, "record_end": start0 + fb})
+    style_inputs, style_err = _caption_style_inputs(p.get("style"))
+    if style_err:
+        return style_err
+
+    video_tracks = int(tl.GetTrackCount("video") or 0)
+    track_index = p.get("track_index")
+    if track_index is not None:
+        if type(track_index) is not int or not 1 <= track_index <= video_tracks:
+            return _err(f"track_index must be an existing video track (1..{video_tracks})",
+                        code="INVALID_TRACK", category="invalid_input")
+        busy = [c["index"] for c in captions for it in (tl.GetItemListInTrack("video", track_index) or [])
+                if _frame_int(it.GetStart()) < c["record_end"] and c["record_start"] < _frame_int(it.GetEnd())]
+        if busy:
+            return _err(f"Video track {track_index} is occupied under caption(s) {sorted(set(busy))}; "
+                        "an append there lands nothing. Omit track_index for a new track.",
+                        code="CAPTION_TRACK_OCCUPIED", category="precondition")
+        locked = _timeline_locked_tracks(tl, [("video", track_index)])
+        if locked:
+            return _track_locked_refusal(locked, "add_captions")
+    plan = {"captions": captions, "track_index": track_index or video_tracks + 1,
+            "new_track": track_index is None, "folder": _CAPTION_FOLDER, "style": style_inputs}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+    refused = _playback_refusal(p, "add_captions", tl=tl)
+    if refused:
+        return refused
+
+    if track_index is None:
+        if not tl.AddTrack("video") or int(tl.GetTrackCount("video") or 0) != video_tracks + 1:
+            return _err("Could not add a video track for the captions", code="ADD_TRACK_FAILED",
+                        category="api_error")
+        track_index = video_tracks + 1
+    root = mp.GetRootFolder()
+    folder = next((f for f in (root.GetSubFolderList() or []) if f.GetName() == _CAPTION_FOLDER), None) \
+        or mp.AddSubFolder(root, _CAPTION_FOLDER)
+    if not folder:
+        return _err(f"Could not create the Media Pool folder {_CAPTION_FOLDER!r}", code="FOLDER_FAILED",
+                    category="api_error")
+    previous_folder = mp.GetCurrentFolder()
+    stamp = time.strftime("%H%M%S")
+    placed_all: List[Dict[str, Any]] = []
+    restore: Dict[str, Any] = {}
+    verified = True
+    try:
+        for cap in captions:
+            if not mp.SetCurrentFolder(folder):
+                return _err(f"Could not open the {_CAPTION_FOLDER!r} bin", code="FOLDER_FAILED",
+                            category="api_error", state={"placed": placed_all})
+            inner = mp.CreateEmptyTimeline(f"MCP Caption {stamp} {cap['index'] + 1:03d}")
+            if not inner:
+                return _err("CreateEmptyTimeline failed for a caption", code="CAPTION_TIMELINE_FAILED",
+                            category="api_error", state={"placed": placed_all})
+            # InsertFusionTitleIntoTimeline writes into the CURRENT timeline, so a
+            # refused switch would put the title into the user's timeline instead.
+            if not proj.SetCurrentTimeline(inner):
+                return _err("Could not switch to the caption timeline", code="TIMELINE_SWITCH_FAILED",
+                            category="api_error", state={"placed": placed_all})
+            title = inner.InsertFusionTitleIntoTimeline("Text+")
+            text_tool = _caption_text_tool(inner) if title else None
+            if text_tool is None:
+                return _err("Could not insert a Text+ title into the caption timeline",
+                            code="CAPTION_TITLE_FAILED", category="api_error", state={"placed": placed_all})
+            text_tool.SetInput("StyledText", cap["text"])
+            for key, value in style_inputs.items():
+                text_tool.SetInput(key, value)
+            cap["text_readback"] = text_tool.GetInput("StyledText") == cap["text"]
+            verified = verified and cap["text_readback"]
+            title_frames = _frame_int(title.GetDuration()) or 0
+            # AppendToTimeline appends to the CURRENT timeline: back to the user's first.
+            if not proj.SetCurrentTimeline(tl):
+                return _err("Could not switch back to the edited timeline", code="TIMELINE_SWITCH_FAILED",
+                            category="api_error", state={"placed": placed_all})
+            inner_mpi = inner.GetMediaPoolItem()
+            cap["items"] = []
+            record = cap["record_start"]
+            while record < cap["record_end"]:
+                length = min(title_frames, cap["record_end"] - record) if title_frames else cap["record_end"] - record
+                landed = mp.AppendToTimeline([{"mediaPoolItem": inner_mpi, "startFrame": 0, "endFrame": length,
+                                               "trackIndex": track_index, "recordFrame": record}]) or []
+                item = landed[0] if landed else None
+                ok = bool(item) and _frame_int(item.GetStart()) == record and \
+                    _frame_int(item.GetEnd()) == record + length
+                verified = verified and ok
+                cap["items"].append({"timeline_item_id": _safe_timeline_item_id(item) if item else None,
+                                     "start": record, "end": record + length, "landed": ok})
+                record += length
+            cap["inner_timeline"] = inner.GetName()
+            placed_all.append(cap)
+    finally:
+        try:
+            restore["timeline"] = bool(proj.SetCurrentTimeline(tl))
+        except Exception as exc:
+            restore["timeline"] = f"SetCurrentTimeline failed: {exc}"
+        if previous_folder:
+            restore["folder"] = bool(mp.SetCurrentFolder(previous_folder))
+    return {"success": verified, "verified": verified, "track_index": track_index,
+            "captions": placed_all, "folder": _CAPTION_FOLDER, "restored": restore}
+
+
+def _timeline_set_caption_text_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Change the text of a caption placed by add_captions (its inner Text+).
+
+    Every piece of a caption longer than the title shares one inner timeline,
+    so they all change. dry_run returns the current text."""
+    item_id = p.get("timeline_item_id")
+    text = p.get("text")
+    if not item_id or not isinstance(text, str) or not text.strip():
+        return _err("set_caption_text requires timeline_item_id and non-empty text",
+                    code="INVALID_INPUT", category="invalid_input")
+    item = _find_timeline_item_by_id(tl, item_id)
+    if item is None:
+        return _err(f"No timeline item with id {item_id!r}", code="ITEM_NOT_FOUND", category="invalid_input")
+    mpi = item.GetMediaPoolItem()
+    inner = mpi.GetTimeline() if mpi is not None and _has_method(mpi, "GetTimeline") else None
+    tool = _caption_text_tool(inner) if inner else None
+    if tool is None:
+        return _err("The item is not a caption (no inner timeline with a Text+ title)",
+                    code="NOT_A_CAPTION", category="invalid_input")
+    current = tool.GetInput("StyledText")
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "current_text": current, "new_text": text,
+                "inner_timeline": inner.GetName()}
+    tool.SetInput("StyledText", text)
+    readback = tool.GetInput("StyledText")
+    return {"success": readback == text, "previous_text": current, "readback": readback,
+            "inner_timeline": inner.GetName()}
 
 
 def _timeline_copy_range_impl(proj, tl, p: Dict[str, Any], *, overwrite: bool = False, resolve=None):
@@ -7199,8 +7687,8 @@ def _timeline_edit_kernel_capabilities():
             "dynamic_zoom_scaling_stabilization": "Copied through exposed TimelineItem.GetProperty/SetProperty keys when a Resolve build returns writable values.",
         },
         "unsupported": {
-            "transition_cloning": "Resolve's public scripting API does not expose timeline item transition cloning.",
-            "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; split_item emulates it by rebuilding the item as two pieces (grade and sizing carried; retime, keyframes and Fusion comps are not).",
+            "transition_cloning": "Resolve has no transition clone verb and cannot read a transition's type, category or alignment. On 21.1+ copy_transition re-creates one at another cut from its name, duration and the alignment inferred from its span (category defaults to simple).",
+            "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; split_item emulates it by rebuilding the item as two pieces (grade, sizing, constant speed and Fusion comps carried; speed ramps and keyframes are not).",
             "source_less_items": "Titles, generators, Fusion compositions, and subtitles without a MediaPoolItem cannot be cloned through AppendToTimeline clipInfo.",
             "deep_speed_ramp_semantics": "Only exposed Speed/RetimeProcess/MotionEstimation properties and supported keyframes are copied; opaque retime curves are not independently inspectable.",
         },
@@ -10310,7 +10798,9 @@ _TIMELINE_AUDIO_KERNEL_ACTIONS = [
     "fairlight_boundary_report",
 ]
 
-_AUDIO_PROPERTY_KEYS = ["Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"]
+# AudioVolume (dB) / AudioPan (-100..100) are the 21.1 audio item keys; Volume and
+# Pan are kept for older builds (Volume returns False, Pan is the video transform).
+_AUDIO_PROPERTY_KEYS = ["AudioVolume", "AudioPan", "Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"]
 
 
 def _audio_capabilities():
@@ -10345,7 +10835,7 @@ def _audio_capabilities():
         "partially_supported": {
             "voice_isolation": "Track/item voice isolation depends on Resolve version, license, page state, and audio content.",
             "transcription_subtitles": "Transcription and subtitle generation can be asynchronous and may require installed AI components.",
-            "audio_property_writes": "Level/pan/EQ writes are not honoured: SetProperty('Volume'/'Gain') returns False and 'Pan' writes the video transform. AudioSyncOffset writes do work. safe_set_audio_properties returns a known_limitation block with the bake / Fairlight-preset workaround.",
+            "audio_property_writes": "Resolve 21.1+: clip level and pan write through 'AudioVolume' (dB) and 'AudioPan' (-100..100) on the audio item (timeline_item set_audio). 'Volume' returns False and 'Pan' is the video transform; before 21.1 there is no level/pan key, and EQ has none on any build. AudioSyncOffset writes do work. Failed level writes return a known_limitation block with the bake / Fairlight-preset workaround.",
             "auto_sync": "AutoSyncAudio depends on media content, channel layout, and selected sync settings.",
         },
         "unsupported": {
@@ -10437,7 +10927,7 @@ def _probe_audio_item(tl, p: Dict[str, Any]):
     return _timeline_item_audio_snapshot(item)
 
 
-_AUDIO_LEVEL_KEYS = {"Volume", "Level", "Gain", "AudioVolume", "Pan", "EQEnable", "EQEnabled"}
+_AUDIO_LEVEL_KEYS = {"Volume", "Level", "Gain", "AudioVolume", "AudioPan", "Pan", "EQEnable", "EQEnabled"}
 
 
 def _audio_write_limitation(written: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -10465,10 +10955,12 @@ def _audio_write_limitation(written: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "keys": hit,
         "reason": "no_api_write_path",
         "explanation": (
-            "Resolve's scripting API cannot set audio clip or track level, pan, "
-            "EQ, or automation. SetProperty writes the video transform only: "
-            "'Volume'/'Level'/'Gain' return False, and 'Pan' is the video "
-            "transform key so it returns True while the audio pan is unchanged."
+            "Resolve 21.1+ sets clip level and pan only through 'AudioVolume' "
+            "(dB) and 'AudioPan' (-100..100) on the audio item — use "
+            "timeline_item set_audio. 'Volume'/'Level'/'Gain' return False, and "
+            "'Pan' is the video transform key so it returns True while the audio "
+            "pan is unchanged. Before 21.1 there is no clip level/pan key, and "
+            "track faders, EQ and automation have no API on any build."
         ),
         "workarounds": [
             "Bake the level into a rendered copy of the source (ffmpeg "
@@ -10542,6 +11034,84 @@ def _safe_set_audio_properties(tl, p: Dict[str, Any]):
     )
     if limitation:
         out["known_limitation"] = limitation
+    return out
+
+
+def _timeline_item_get_audio(item) -> Dict[str, Any]:
+    """Audio level/pan of an item: its own 21.1 keys on an audio track, else its
+    linked audio items' (a video item carries no audio level)."""
+    targets = _audio_levels.audio_targets(item) or [item]
+    keys = [_audio_levels.AUDIO_VOLUME_KEY, _audio_levels.AUDIO_PAN_KEY,
+            "AudioSyncOffsetIsManual", "AudioSyncOffset"]
+
+    def _read(target):
+        row = {}
+        for key in keys:
+            try:
+                row[key] = target.GetProperty(key)
+            except Exception as exc:
+                row[key] = {"error": str(exc)}
+        return row
+
+    out = _read(targets[0])
+    if len(targets) > 1:
+        out["linked_audio"] = {str(_safe_timeline_item_id(t)): _read(t) for t in targets}
+    out["units"] = {"AudioVolume": "dB (-100..+30)", "AudioPan": "-100 left .. 100 right"}
+    return out
+
+
+def _timeline_item_set_audio(item, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Clip audio level and pan (Resolve 21.1+), with readback.
+
+    AudioVolume (dB) and AudioPan (-100..100) are the 21.1 audio item keys;
+    Volume / volume_db and Pan are accepted as aliases in the same units. A
+    video item writes its linked audio items: on a video item 'Pan' is the
+    picture transform. AudioSyncOffset* pass through to the item. Before 21.1
+    the level keys do not exist and a known_limitation block is returned.
+    """
+    def _pick(*names):
+        for name in names:
+            if p.get(name) is not None:
+                return p[name]
+        return None
+
+    volume = _pick("AudioVolume", "volume_db", "Volume")
+    pan = _pick("AudioPan", "Pan")
+    sync = {k: p[k] for k in ("AudioSyncOffsetIsManual", "AudioSyncOffset") if k in p}
+    if volume is None and pan is None and not sync:
+        return _err("Specify one or more of: AudioVolume (dB), AudioPan (-100..100), "
+                    "AudioSyncOffset, AudioSyncOffsetIsManual (Volume/Pan are aliases)")
+    out: Dict[str, Any] = {"success": True}
+    if sync:
+        out["sync"] = {k: bool(item.SetProperty(k, v)) for k, v in sync.items()}
+        out["success"] = all(out["sync"].values())
+    if volume is None and pan is None:
+        return out
+    try:
+        volume = None if volume is None else float(volume)
+        pan = None if pan is None else float(pan)
+    except (TypeError, ValueError):
+        return _err("AudioVolume and AudioPan must be numbers", code="INVALID_AUDIO_VALUE",
+                    category="invalid_input")
+    targets = _audio_levels.audio_targets(item)
+    if not targets:
+        return _err("The item has no audio: not on an audio track and no linked audio items",
+                    code="NO_AUDIO_ITEM", category="invalid_input")
+    if not all(_audio_levels.audio_level_api(t) for t in targets):
+        out["success"] = False
+        requested = {}
+        if volume is not None:
+            requested["AudioVolume"] = False
+        if pan is not None:
+            requested["AudioPan"] = False
+        out["known_limitation"] = _audio_write_limitation(requested)
+        return out
+    out["targets"] = []
+    for target in targets:
+        rows = _audio_levels.write_audio_levels(target, volume_db=volume, pan=pan)
+        out["targets"].append({"timeline_item_id": _safe_timeline_item_id(target), "results": rows})
+        if not all(r["verified"] for r in rows.values()):
+            out["success"] = False
     return out
 
 
@@ -27841,7 +28411,7 @@ _TIMELINE_ACTIONS = [
     "add_track", "delete_track", "get_track_sub_type", "set_track_enable",
     "get_track_enabled", "set_track_lock", "get_track_locked", "get_track_name",
     "set_track_name", "get_items", "delete_clips", "set_clips_linked", "duplicate",
-    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_range", "duplicate_range",
+    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_transition", "add_captions", "set_caption_text", "copy_range", "duplicate_range",
     "overwrite_range", "lift_range", "story_spine_report", "create_variant_from_ranges",
     "bulk_set_item_properties", "apply_look_to_items", "thumbnail_contact_sheet",
     "marker_thumbnail_review", "edit_kernel_capabilities", "probe_edit_kernel_item",
@@ -27937,7 +28507,15 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         (AppendToTimeline can return null-id items, e.g. into an occupied span).
         NEVER use move_clips to open a gap for an insert — that is what ripple_insert is for.
       replace_source_range(timeline_item_id, source_start|slip_frames, source_end?, unlock_track?, ignore_linked?, dry_run?, confirm_token?) -> {success, verified, timing, steps}
-      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
+      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, work_dir?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
+      copy_transition(transition_id, before_item_id|after_item_id, category?="simple", type?, dry_run?) -> {success, verified, transition{name,start,end,duration,alignment}, plan}
+        Resolve 21.1+. Copies name, duration and alignment (inferred from the span vs its cut)
+        onto the cut after before_item_id / before after_item_id; category is unreadable, default simple.
+      add_captions(segments=[{start,end,text}] | clip_id (+record_offset, max_words?=3), track_index?, style?{font,size,color[r,g,b],position}, dry_run?) -> {success, verified, track_index, captions[{text, items[{timeline_item_id,start,end}], inner_timeline}]}
+        Text+ captions on any video track (default: a new track on top). Seconds are from the
+        timeline start; clip_id chunks the clip's word transcription into max_words captions.
+        Each caption is a Text+ in its own timeline in the "MCP Captions" bin, appended at its frame.
+      set_caption_text(timeline_item_id, text, dry_run?) -> {success, previous_text, readback}
         Slip a video item to a new source range at the same record frame, keeping grade,
         transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
         temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->
@@ -28404,6 +28982,12 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         return _timeline_replace_source_range_impl(proj, tl, p, resolve=get_resolve())
     elif action == "split_item":
         return _timeline_split_item_impl(proj, tl, p, resolve=get_resolve())
+    elif action == "copy_transition":
+        return _timeline_copy_transition_impl(tl, p)
+    elif action == "add_captions":
+        return _timeline_add_captions_impl(proj, tl, p, resolve=get_resolve())
+    elif action == "set_caption_text":
+        return _timeline_set_caption_text_impl(tl, p)
     elif action in {"copy_range", "duplicate_range"}:
         return _timeline_copy_range_impl(proj, tl, p)
     elif action == "overwrite_range":
@@ -29293,8 +29877,10 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       set_crop(CropLeft?, CropRight?, CropTop?, CropBottom?, CropSoftness?, CropRetain?, ...) -> {success}
       get_composite(...) -> {Opacity, CompositeMode}
       set_composite(Opacity?, CompositeMode?, ...) -> {success}
-      get_audio(...) -> {Volume, Pan, AudioSyncOffset, ...}
-      set_audio(Volume?, Pan?, ...) -> {success, known_limitation?}
+      get_audio(...) -> {AudioVolume, AudioPan, AudioSyncOffset, ..., linked_audio?}
+      set_audio(AudioVolume?|volume_db?|Volume?, AudioPan?|Pan?, AudioSyncOffset?, ...) -> {success, targets[{timeline_item_id, results}], known_limitation?}
+        Resolve 21.1+: AudioVolume in dB (clamped -100..+30), AudioPan -100 left..100 right, read back.
+        A video item writes its linked audio. Before 21.1 returns known_limitation.
         — Resolve ignores Volume/Pan/EQ writes on audio; those return a
           `known_limitation` block (bake gain into the media, or apply a
           Fairlight preset). AudioSyncOffset / AudioSyncOffsetIsManual do work.
@@ -29556,23 +30142,9 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
 
     # ── Audio ──
     elif action == "get_audio":
-        keys = ["Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"]
-        return {k: item.GetProperty(k) for k in keys}
+        return _timeline_item_get_audio(item)
     elif action == "set_audio":
-        valid = {"Volume", "Pan", "AudioSyncOffsetIsManual", "AudioSyncOffset"}
-        results = {}
-        for k, v in p.items():
-            if k in valid:
-                results[k] = bool(item.SetProperty(k, v))
-        if not results:
-            return _err(f"Specify one or more of: {', '.join(sorted(valid))}")
-        out = _ok(**results)
-        # Volume/Pan writes go nowhere on audio (see _audio_write_limitation);
-        # AudioSyncOffset does work, so only flag when a level/pan key was asked.
-        limitation = _audio_write_limitation(results)
-        if limitation:
-            out["known_limitation"] = limitation
-        return out
+        return _timeline_item_set_audio(item, p)
 
     elif action == "probe_keyframe_override":
         proj, _, perr = _get_tl()
@@ -29719,6 +30291,9 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
       rename_comp(old_name, new_name, ...) -> {success}
       get_cache_enabled(...) -> {enabled}  — Fusion output cache status
       set_cache(value, ...) -> {success}  — value: "Auto", "On", or "Off"
+      animate_transform(keyframes=[{frame, size?, center?:[x,y], angle?}], new_comp?, dry_run?) -> {success, verified, readback, comp_added}
+        Keyframed transform via a Fusion Transform inserted before MediaOut1 (first comp, or a new one).
+        frame is relative to the item start; Center normalised (0.5,0.5 = centre); Angle in degrees.
 
     Default: track_type="video", track_index=1, item_index=0
     Or address the item by timeline_item_id (its GetUniqueId(), stable); on
@@ -29759,7 +30334,125 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
         return {"enabled": item.GetIsFusionOutputCacheEnabled()}
     elif action == "set_cache":
         return {"success": bool(item.SetFusionOutputCache(p["value"]))}
-    return _unknown(action, ["add_comp","get_comp_count","get_comp_names","get_comp_by_name","get_comp_by_index","export_comp","import_comp","delete_comp","load_comp","rename_comp","get_cache_enabled","set_cache"])
+    elif action == "animate_transform":
+        return _timeline_item_animate_transform(item, p)
+    return _unknown(action, ["add_comp","get_comp_count","get_comp_names","get_comp_by_name","get_comp_by_index","export_comp","import_comp","delete_comp","load_comp","rename_comp","get_cache_enabled","set_cache","animate_transform"])
+
+
+def _dry_run_requested(p: Dict[str, Any]) -> bool:
+    """Dry run, read exactly as the destructive hook reads it (dry_run / dryRun):
+    the hook skips the archive for a dry run, so the handler must not mutate on
+    any alias the hook accepts."""
+    return _explicit_bool_param(p, "dry_run", "dryRun") is True
+
+
+_ANIMATE_TRANSFORM_INPUTS = {"size": "Size", "angle": "Angle", "center": "Center"}
+
+
+def _timeline_item_animate_transform(item, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Keyframed Size / Center / Angle through a Fusion Transform on the item.
+
+    Measured on Studio 21.1.1: the item's comp renders 0..duration-1 (item
+    relative; any COMPN_RenderStart offset is added); a Transform inserted
+    between MediaOut1 and its upstream animates once its input holds a
+    BezierSpline (Size, Angle) or Path (Center) and SetInput(name, value, frame)
+    is called per key (it returns None but sets); GetInput(name, frame) reads
+    the values back. Uses the item's first comp, or adds one (new_comp=true
+    always adds). keyframes: [{frame, size?, center?: [x, y], angle?}], frame
+    relative to the item start; Center is normalised (0.5, 0.5 = centre).
+    """
+    keyframes = p.get("keyframes")
+    if not isinstance(keyframes, list) or not keyframes:
+        return _err("keyframes must be a non-empty list of {frame, size?, center?, angle?}",
+                    code="INVALID_KEYFRAMES", category="invalid_input")
+    try:
+        duration = int(item.GetDuration())
+    except Exception:
+        duration = None
+    rows: List[Dict[str, Any]] = []
+    for index, key in enumerate(keyframes):
+        where = f"keyframes[{index}]"
+        if not isinstance(key, dict) or type(key.get("frame")) is not int:
+            return _err(f"{where}.frame must be an integer", code="INVALID_KEYFRAMES", category="invalid_input")
+        frame = key["frame"]
+        if frame < 0 or (duration is not None and frame >= duration):
+            return _err(f"{where}.frame {frame} is outside the item (0..{(duration or 1) - 1})",
+                        code="INVALID_KEYFRAMES", category="invalid_input")
+        row: Dict[str, Any] = {"frame": frame}
+        for name, fusion_name in _ANIMATE_TRANSFORM_INPUTS.items():
+            if key.get(name) is None:
+                continue
+            value = key[name]
+            if name == "center":
+                if (not isinstance(value, (list, tuple)) or len(value) != 2
+                        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)):
+                    return _err(f"{where}.center must be [x, y]", code="INVALID_KEYFRAMES", category="invalid_input")
+                row[fusion_name] = {1: float(value[0]), 2: float(value[1])}
+            else:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return _err(f"{where}.{name} must be a number", code="INVALID_KEYFRAMES", category="invalid_input")
+                if name == "size" and value <= 0:
+                    return _err(f"{where}.size must be > 0", code="INVALID_KEYFRAMES", category="invalid_input")
+                row[fusion_name] = float(value)
+        if len(row) == 1:
+            return _err(f"{where} sets none of size, center, angle", code="INVALID_KEYFRAMES",
+                        category="invalid_input")
+        rows.append(row)
+    properties = sorted({k for row in rows for k in row if k != "frame"})
+    plan = {"timeline_item_id": _safe_timeline_item_id(item), "properties": properties,
+            "keyframes": len(rows), "duration": duration}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+
+    try:
+        count = int(item.GetFusionCompCount() or 0)
+    except Exception:
+        count = 0
+    if count and not _coerce_bool(p.get("new_comp")):
+        comp, comp_added = item.GetFusionCompByIndex(1), False
+    else:
+        comp, comp_added = item.AddFusionComp(), True
+    if not comp:
+        return _err("Could not get or add a Fusion comp on the item", code="FUSION_COMP_FAILED",
+                    category="api_error")
+    media_out = comp.FindTool("MediaOut1")
+    if media_out is None:
+        return _err("The comp has no MediaOut1", code="FUSION_NO_MEDIA_OUT", category="api_error")
+    upstream = media_out.Input.GetConnectedOutput()
+    upstream_tool = upstream.GetTool() if upstream else comp.FindTool("MediaIn1")
+    if upstream_tool is None:
+        return _err("Nothing feeds MediaOut1 and there is no MediaIn1", code="FUSION_NO_INPUT",
+                    category="api_error")
+    transform = comp.AddTool("Transform", -32768, -32768)
+    if transform is None:
+        return _err("comp.AddTool('Transform') returned nothing", code="FUSION_ADD_TOOL_FAILED",
+                    category="api_error")
+    wired = bool(transform.ConnectInput("Input", upstream_tool)) and bool(media_out.ConnectInput("Input", transform))
+    try:
+        offset = int(round(float((comp.GetAttrs() or {}).get("COMPN_RenderStart") or 0)))
+    except Exception:
+        offset = 0
+    for name in properties:
+        setattr(transform, name, comp.Path() if name == "Center" else comp.BezierSpline())
+    for row in rows:
+        for name in properties:
+            if name in row:
+                transform.SetInput(name, row[name], row["frame"] + offset)
+
+    def _close(got, want):
+        if isinstance(want, dict):
+            return isinstance(got, dict) and all(abs(float(got.get(k, 1e9)) - v) < 1e-4 for k, v in want.items())
+        return isinstance(got, (int, float)) and abs(float(got) - want) < 1e-4
+
+    readback, verified = [], wired
+    for row in rows:
+        got = {name: _ser(transform.GetInput(name, row["frame"] + offset)) for name in properties if name in row}
+        ok = all(_close(transform.GetInput(name, row["frame"] + offset), row[name]) for name in got)
+        verified = verified and ok
+        readback.append({"frame": row["frame"], "values": got, "match": ok})
+    return {"success": verified, "verified": verified, "comp_added": comp_added,
+            "tool": getattr(transform, "Name", "Transform"), "upstream": getattr(upstream_tool, "Name", None),
+            "comp_frame_offset": offset, "readback": readback, "plan": plan}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -29776,6 +30469,7 @@ _COLOR_GRADE_KERNEL_ACTIONS = [
     "safe_set_cdl",
     "safe_copy_grade",
     "safe_apply_drx",
+    "apply_wheels",
     "apply_trace_plan",
     "safe_export_lut",
     "grade_version_snapshot",
@@ -30370,6 +31064,102 @@ def _safe_export_lut(item, p: Dict[str, Any]):
         "size": os.path.getsize(path) if os.path.exists(path) else 0,
         "overwrote_existing": before_exists and os.path.exists(path),
     }
+
+
+def _apply_wheels(proj, item, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
+    """Primary wheels (lift / gamma / gain, master number or [r, g, b]; saturation 0-100).
+
+    The API cannot write wheel values (api_truth 'Color node graph editing and
+    primary grade values'). method="drx" (default): the offline DRX generator
+    writes a one-node grade with the wheels (Resolve panel units) and
+    Graph.ApplyGradeFromDRX applies it on the Color page (the previous page is
+    restored). If the generator is unavailable it falls back to method="cdl":
+    SetCDL with slope ~ gain, offset ~ lift, power ~ gamma (approximate).
+
+    Never silently wipes a grade: AddVersion first copies the current grade into
+    a new local version (version_name, default "MCP wheels N") and makes it
+    current, then the wheels replace that version's graph; the previous version
+    is reported and stays loadable (measured on Studio 21.1.1). Inspect frames
+    before grading (AGENTS.md: frame-referenced color work).
+    """
+    try:
+        params = _color_wheels.grade_params(p.get("lift"), p.get("gamma"), p.get("gain"), p.get("saturation"))
+    except _color_wheels.WheelError as exc:
+        return _err(str(exc), code="INVALID_WHEELS", category="invalid_input")
+    method = str(p.get("method") or "drx").lower()
+    if method not in ("drx", "cdl"):
+        return _err("method must be 'drx' or 'cdl'", code="INVALID_METHOD", category="invalid_input")
+    cdl = _color_wheels.cdl_approximation(params)
+    try:
+        previous = _ser(item.GetCurrentVersion())
+    except Exception:
+        previous = None
+    try:
+        existing = list(item.GetVersionNameList(0) or [])
+    except Exception:
+        existing = []
+    version_name = p.get("version_name")
+    if not version_name:
+        n = 1
+        while f"MCP wheels {n}" in existing:
+            n += 1
+        version_name = f"MCP wheels {n}"
+    if version_name in existing:
+        return _err(f"A local version named {version_name!r} already exists", code="VERSION_EXISTS",
+                    category="invalid_input")
+    plan = {"timeline_item_id": _safe_timeline_item_id(item), "method": method, "grade_params": params,
+            "cdl_approximation": cdl, "new_version": version_name, "previous_version": previous,
+            "note": "the wheels replace the graph of a NEW local version; the previous version is kept"}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+    if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
+        return _issue_confirm_token(action="apply_wheels", params=p, preview={
+            "operation": "timeline_item_color.apply_wheels",
+            "warning": "Adds a local grade version and replaces its graph with the wheels grade.", **plan})
+    blocked = _consume_confirm_token(action="apply_wheels", params=p)
+    if blocked:
+        return blocked
+
+    out: Dict[str, Any] = {"plan": plan, "previous_version": previous}
+    drx_path = None
+    if method == "drx":
+        work_dir = p.get("work_dir") or _resolve_safe_dir(tempfile.gettempdir())
+        drx_path = os.path.join(work_dir, f"mcp_wheels_{_safe_timeline_item_id(item)}_{int(time.time() * 1000)}.drx")
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+            out["drx"] = _color_wheels.generate_drx(params, drx_path, label=version_name)
+        except Exception as exc:
+            method, out["fallback_reason"] = "cdl", f"DRX generation failed: {exc}"
+    if not item.AddVersion(version_name, 0):
+        return _err(f"AddVersion({version_name!r}) failed; nothing was applied", code="ADD_VERSION_FAILED",
+                    category="api_error", state=out)
+    out["version"] = _ser(item.GetCurrentVersion())
+    page = None
+    try:
+        page = resolve.GetCurrentPage() if resolve is not None else None
+        if resolve is not None and page != "color" and not resolve.OpenPage("color"):
+            return _err("Could not open the Color page for ApplyGradeFromDRX / SetCDL; the new version "
+                        f"{version_name!r} holds a copy of the previous grade", code="PAGE_SWITCH_FAILED",
+                        category="api_error", state=out)
+        if method == "drx":
+            graph = item.GetNodeGraph(1)
+            if not graph or not _has_method(graph, "ApplyGradeFromDRX"):
+                return _err("The item graph does not expose ApplyGradeFromDRX", code="APPLY_DRX_UNSUPPORTED",
+                            category="unsupported", state=out)
+            applied = _apply_drx_with_readback(graph, "item", drx_path, 0,
+                                               _drx_candidate_graphs("item", item=item))
+            if "error" in applied:
+                return applied
+            out.update({"applied": applied, "success": bool(applied.get("success"))})
+        else:
+            normalized = _normalize_cdl(cdl)
+            ok = bool(item.SetCDL(normalized))
+            out.update({"cdl": normalized, "success": ok})
+    finally:
+        if resolve is not None and page and page != "color":
+            out["page_restored"] = bool(resolve.OpenPage(page))
+    out["method_used"] = method
+    return out
 
 
 def _safe_apply_drx(proj, item, p: Dict[str, Any]):
@@ -31677,6 +32467,11 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
       safe_apply_drx(path, source?, grade_mode?, require_temp_path?) -> {success, path, source, changed_graphs, graphs, verification, warning?}
         REPLACES the target graph. Captures a version snapshot first; require_temp_path defaults True.
         # example: action_help(name='<action_name>')
+      apply_wheels(lift?, gamma?, gain?, saturation?, method?="drx", version_name?, work_dir?, dry_run?, confirm_token?) -> {success, method_used, version, previous_version, applied|cdl, fallback_reason?}
+        Primary wheels in Resolve panel units: lift/gamma a master number or [r,g,b] around 0
+        (~±0.05), gain around 1.0, saturation 0-100 (50 neutral). Generates a one-node .drx
+        offline and applies it on the Color page; falls back to SetCDL (approximate) without the
+        generator. Always on a NEW local version: the previous grade stays loadable.
       apply_trace_plan(plan_path|plan, dry_run?, min_confidence?=0.8, start_tolerance?=0, grade_mode?=0, version_name?, require_temp_path?=True, allow_timeline_mismatch?, max_rows?=40, verbose?, report_path?, confirm_token?) -> {success, applied, failed, skipped, attention, summary, report_path}
         The live half of the advanced server's color_trace (a ColorTrace that matches on media
         identity, cross-project, from the project DB). Resolves each plan entry to a clip on the
@@ -31756,6 +32551,8 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
         return _safe_copy_grade(item, p)
     elif action == "safe_apply_drx":
         return _safe_apply_drx(proj, item, p)
+    elif action == "apply_wheels":
+        return _apply_wheels(proj, item, p, resolve=get_resolve())
     elif action == "safe_export_lut":
         return _safe_export_lut(item, p)
     elif action == "grade_version_snapshot":

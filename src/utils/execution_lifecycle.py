@@ -261,6 +261,8 @@ class RiskClassificationHook(LifecycleHook):
         ("timeline_item_color", "reset_all_node_colors"),
         ("timeline_item_color", "rename_version"),
         ("timeline_item_fusion", "add_comp"),
+        # Adds (or edits) a Fusion comp: a keyframed Transform before MediaOut1.
+        ("timeline_item_fusion", "animate_transform"),
         ("timeline_item_fusion", "rename_comp"),
         ("timeline_item_takes", "add"),
         ("timeline_item_takes", "select"),
@@ -339,6 +341,12 @@ class RiskClassificationHook(LifecycleHook):
 
         ("timeline", "normalize_audio_level"),
         ("timeline_item", "add_transition"),
+        # copy_transition adds the same native transition at another cut.
+        ("timeline", "copy_transition"),
+        # Captions add a track, bin timelines and title items; set_caption_text
+        # rewrites one caption's Text+.
+        ("timeline", "add_captions"),
+        ("timeline", "set_caption_text"),
         ("timeline_item", "set_speed"),
         ("timeline_item", "set_fades"),
         # Pool reorganisation: clips and bins move, nothing is destroyed, but
@@ -359,6 +367,8 @@ class RiskClassificationHook(LifecycleHook):
         ("timeline_item_color", "add_version"),
         ("timeline_item_color", "load_version"),
         ("timeline_item_color", "set_cdl"),
+        # apply_wheels: AddVersion, then the wheels replace the new version's graph.
+        ("timeline_item_color", "apply_wheels"),
         ("timeline_item_color", "assign_color_group"),
         ("timeline_item_color", "stabilize"),
         ("timeline_item_color", "smart_reframe"),

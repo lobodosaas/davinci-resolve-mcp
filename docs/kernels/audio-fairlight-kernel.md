@@ -97,7 +97,10 @@ de-essing, or limiting.
 
 - Timeline item audio properties may be readable as `None` and can reject writes
   for some generated item types. The release probe saw `Volume` write and
-  restore return false.
+  restore return false. On Resolve 21.1+ the clip level and pan keys are
+  `AudioVolume` (dB, clamped -100..+30) and `AudioPan` (-100..100): measured on
+  Studio 21.1.1, `AudioVolume=-12` dropped the rendered level by exactly 12 dB
+  and `AudioPan=-100` panned hard left. `timeline_item set_audio` writes them.
 - `AutoSyncAudio` depends on media content and Resolve's sync engine. The
   guarded call normalized waveform/channel settings but Resolve returned false
   for the generated video/audio pair.

@@ -80,6 +80,7 @@ in success and in error responses.
 | Timeline item Fusion comp | Supported | Tool add, input writes, connections, frame range, comp export | Primary safe automation target. Pass `timeline_item`, `clip_id`, or `timeline_item_id`. |
 | Active Fusion page comp | Supported when a current comp exists | Raw and safe graph helpers work against the active page comp | Page state matters; omit timeline scope only when that is intentional. |
 | Bulk timeline item comps | Supported | `bulk_set_inputs` requires explicit timeline scope per op | Avoids accidentally mutating the active page comp. |
+| Keyframed transform | Supported through `timeline_item_fusion animate_transform` | Transform inserted before MediaOut1; Size/Angle on a BezierSpline, Center on a Path, read back per key (21.1.1) | Comp frames are item-relative (render range 0..duration-1). |
 | Comp import/export | Supported through `timeline_item_fusion` | Export succeeded to a temp `.setting` file in the live probe | Import should use temp or explicitly approved paths. |
 
 ## Supported Findings

@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 import src.server as s
+import src.server as s_mod
 
 
 class _Pool:
@@ -83,6 +84,24 @@ class _Item:
     def GetSpeed(self):
         return {"Percentage": self.speed, "PitchCorrection": True}
 
+    def SetSpeed(self, speed):
+        self.speed = float(speed["Percentage"])  # record duration kept, like Resolve
+        return True
+
+    def ExportFusionComp(self, path, index):
+        if index > self.fusion:
+            return False
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"comp {index} of {self.uid}")
+        self.tl.exported.append(path)
+        return True
+
+    def ImportFusionComp(self, path):
+        with open(path, encoding="utf-8") as fh:
+            self.imported = getattr(self, "imported", []) + [fh.read()]
+        self.fusion += 1
+        return object()
+
     def GetProperty(self, key=None):
         return self.props.get(key)
 
@@ -124,6 +143,7 @@ class _Timeline:
         self.lock_calls = []
         self.links = {}
         self.link_calls = []
+        self.exported = []
 
     def all_items(self):
         return [i for kind in self.tracks.values() for items in kind.values() for i in items]
@@ -268,15 +288,44 @@ class SplitItemTest(unittest.TestCase):
             self.assertEqual(out["error"]["code"], "CUT_OUTSIDE_ITEM", frame)
         self.assertEqual(mp.appends, [])
 
-    def test_fusion_and_retime_block(self):
+    def test_reverse_or_freeze_speed_blocks(self):
         proj, tl, mp, video, _ = self._fixture()
-        video.fusion = 1
-        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
-        self.assertEqual(out["error"]["code"], "SPLIT_BLOCKED")
-        video.fusion, video.speed = 0, 50.0
-        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
-        self.assertEqual(out["error"]["code"], "SPLIT_BLOCKED")
+        for speed in (-100.0, 0.0):
+            video.speed = speed
+            out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
+            self.assertEqual(out["error"]["code"], "SPLIT_BLOCKED", speed)
         self.assertEqual(mp.appends, [])
+
+    def test_constant_speed_is_carried_with_scaled_source(self):
+        # Probe on 21.1.1: a 48-frame item at 50% from source 0, cut at +24 ->
+        # pieces 86400-86424 (src 0-12) and 86424-86448 (src 12-24).
+        proj, tl, mp, video, audio = self._fixture()
+        for item in (video, audio):
+            item.duration, item.src_start, item.speed = 48, 0, 50.0
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "offset": 24})
+        self.assertTrue(out["success"], out)
+        self.assertTrue(out["verified"], out)
+        for kind in ("video", "audio"):
+            pieces = sorted(tl.tracks[kind][1], key=lambda i: i.start)
+            self.assertEqual([(i.start, i.GetEnd(), i.src_start, i.speed) for i in pieces],
+                             [(86400, 86424, 0, 50.0), (86424, 86448, 12, 50.0)], kind)
+        # each append spans the piece's record length; Resolve rescales on SetSpeed
+        finals = [a for a in mp.appends if a["trackIndex"] == 1 and int(a.get("mediaType", 1)) == 1]
+        self.assertEqual([(a["startFrame"], a["endFrame"]) for a in finals], [(0, 24), (12, 36)])
+
+    def test_fusion_comps_are_carried_to_both_pieces(self):
+        import tempfile
+        proj, tl, mp, video, _ = self._fixture()
+        video.fusion = 2
+        with tempfile.TemporaryDirectory() as work:
+            out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440, "work_dir": work})
+            self.assertTrue(out["success"], out)
+            self.assertTrue(out["verified"], out)
+            self.assertTrue(all(p.startswith(work) for p in tl.exported), tl.exported)
+        v = sorted(tl.tracks["video"][1], key=lambda i: i.start)
+        self.assertEqual([i.fusion for i in v], [2, 2])
+        self.assertEqual(v[0].imported, [f"comp 1 of {video.uid}", f"comp 2 of {video.uid}"])
+        self.assertIn("fusion", out["steps"]["video:1"])
 
     def test_locked_track_needs_unlock_track(self):
         proj, tl, mp, video, _ = self._fixture(locked=True)
@@ -295,6 +344,15 @@ class SplitItemTest(unittest.TestCase):
         self.assertEqual(out["plan"]["linked_audio"], [audio.uid])
         self.assertEqual(mp.appends, [])
 
+    def test_dry_run_camel_case_alias_changes_nothing(self):
+        # The destructive hook treats dryRun as a dry run and skips the archive,
+        # so the handler must not mutate on it either.
+        proj, tl, mp, video, _ = self._fixture()
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440, "dryRun": True})
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["plan"]["cut_frame"], 86440)
+        self.assertEqual(mp.appends, [])
+
     def test_confirm_token_gated(self):
         proj, tl, mp, video, _ = self._fixture()
         with mock.patch.object(s, "_confirm_token_required", return_value=True), \
@@ -311,6 +369,24 @@ class SplitItemTest(unittest.TestCase):
         self.assertIn(("timeline", "split_item"), s._TOKEN_GATED_DESTRUCTIVE_ACTIONS)
         self.assertTrue(classify_operation_risk("timeline", "split_item", {}).to_dict()["recognised"])
         self.assertIn("split_item", s._timeline_edit_kernel_capabilities()["supported"]["clip_operations"])
+
+
+class SplitCarriesAudioLevelTest(SplitItemTest):
+    def test_linked_audio_pieces_keep_volume_and_pan(self):
+        proj, tl, mp, video, audio = self._fixture()
+        audio.props.update({"AudioVolume": -12.0, "AudioPan": -100.0})
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
+        self.assertTrue(out["verified"], out)
+        pieces = tl.tracks["audio"][1]
+        self.assertEqual(len(pieces), 2)
+        for piece in pieces:
+            self.assertEqual(piece.props.get("AudioVolume"), -12.0)
+            self.assertEqual(piece.props.get("AudioPan"), -100.0)
+
+    def test_duplicate_audio_group_uses_21_1_keys(self):
+        keys = s_mod._DUPLICATE_COPY_PROPERTY_KEYS["audio"]
+        self.assertIn("AudioVolume", keys)
+        self.assertIn("AudioPan", keys)
 
 
 if __name__ == "__main__":
