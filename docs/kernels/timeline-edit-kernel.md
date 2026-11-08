@@ -64,6 +64,19 @@ Supported placement controls:
 `copy_clips` is an alias for duplication. `move_clips` duplicates successfully
 first, then deletes the original source items.
 
+### Split (razor)
+
+`timeline(action="split_item")` cuts a video item, and by default its linked
+audio, in two at `frame` (absolute record frame) or `offset` (frames from the
+item start). Resolve has no split primitive and an append onto an occupied
+range lands nothing, so each item is rebuilt through a temporary track: pieces
+A and B are appended there with grade and properties carried, the original is
+deleted, the final pieces land on the original track and receive the grade and
+properties again, and the temporary track is removed. Video and audio are
+unlinked first and A/B are relinked after. Refused: a cut outside the item,
+retimed items, items with Fusion comps, locked tracks without `unlock_track`.
+A trim is a split followed by `lift_range` on the unwanted piece.
+
 ### Linked audio
 
 `include_linked=True` duplicates linked audio items alongside the source video
@@ -158,8 +171,11 @@ Current partial areas:
 These are blocked by Resolve's public scripting API, not by MCP plumbing:
 
 - Transition cloning: no public timeline-item transition clone/read/write API.
-- Razor/split edits: no direct public timeline split primitive.
-- True partial lift: no safe partial-item delete without a split primitive.
+- Razor/split edits: no direct public timeline split primitive; `split_item`
+  emulates it by rebuild (retime, Inspector keyframes and Fusion comps are not
+  carried).
+- True partial lift: no direct partial-item delete; `split_item` then
+  `lift_range` on the unwanted piece.
 - Source-less item cloning through append: titles, generators, Fusion
   compositions, and subtitles can exist on the timeline, but source-less items
   do not provide a Media Pool item that `AppendToTimeline([{clipInfo}])` can

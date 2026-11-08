@@ -1378,6 +1378,7 @@ _TOKEN_GATED_DESTRUCTIVE_ACTIONS = frozenset({
     ("timeline", "apply_cuts"),
     ("timeline", "ripple_insert"),
     ("timeline", "replace_source_range"),
+    ("timeline", "split_item"),
     # Catastrophic media-pool deletes (EX3): irreversibly destroy clips/folders/
     # timelines. Gated like delete_track; also archive-on-mutate via the registry.
     ("media_pool", "delete_clips"),
@@ -5983,10 +5984,11 @@ def _slip_property_mismatches(expected: Dict[str, Any], item) -> Dict[str, Any]:
     return mismatches
 
 
-def _slip_item_at(tl, track_index: int, record_frame: int, mpi_id: Optional[str]):
-    """The video item starting at record_frame on a track (newest on a tie)."""
+def _slip_item_at(tl, track_index: int, record_frame: int, mpi_id: Optional[str],
+                  track_type: str = "video"):
+    """The item starting at record_frame on a track (newest on a tie)."""
     try:
-        items = tl.GetItemListInTrack("video", track_index) or []
+        items = tl.GetItemListInTrack(track_type, track_index) or []
     except Exception:
         return None
     found = None
@@ -6003,7 +6005,7 @@ def _slip_item_at(tl, track_index: int, record_frame: int, mpi_id: Optional[str]
 
 
 def _slip_append(mp, tl, info: Dict[str, Any], *, duration: int, ratio: float,
-                 mpi_id: Optional[str], resolve=None):
+                 mpi_id: Optional[str], resolve=None, track_type: str = "video"):
     """Append one clipInfo and PROVE it landed at the right start and length.
 
     Returns (item, final_info, attempts). A wrong-length append is deleted and
@@ -6025,7 +6027,7 @@ def _slip_append(mp, tl, info: Dict[str, Any], *, duration: int, ratio: float,
         except Exception as exc:
             attempts.append({"endFrame": info["endFrame"], "error": f"AppendToTimeline raised: {exc}"})
             return None, info, attempts
-        landed = _slip_item_at(tl, track_index, record, mpi_id)
+        landed = _slip_item_at(tl, track_index, record, mpi_id, track_type)
         if landed is None:
             attempts.append({"endFrame": info["endFrame"], "returned": bool(returned),
                              "error": "nothing landed at the record frame"})
@@ -6769,6 +6771,255 @@ def _collect_timeline_items_in_range(tl, p: Dict[str, Any]):
     return start, end, items, None
 
 
+def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float, resolve=None):
+    """Rebuild one timeline item as two pieces cut at ``cut`` (absolute record frame).
+
+    Same rebuild as replace_source_range, with two pieces: an AppendToTimeline onto an
+    occupied record range lands nothing (measured on Studio 21.1.1), so the pieces go to
+    a temporary track first, carry the grade and properties, the original goes, and the
+    final pieces land on the original track. Returns (pieces [a, b] | None, steps, error).
+    """
+    steps: Dict[str, Any] = {}
+    info, _ = _timeline_item_track_info(item)
+    track_index = info[1]
+    mpi = _timeline_item_media_pool_item(item)
+    mpi_id = _safe_media_pool_item_id(mpi)
+    start, end = _frame_int(item.GetStart()), _frame_int(item.GetEnd())
+    src0 = _timeline_item_source_start(item)
+    media_type = 1 if track_type == "video" else 2
+    src_cut = src0 + int(round((cut - start) * ratio))
+    src_end = src0 + int(round((end - start) * ratio))
+    specs = [(start, src0, src_cut, cut - start), (cut, src_cut, src_end, end - cut)]
+
+    def _place(track):
+        pieces, attempts = [], []
+        for record, s_start, s_end, duration in specs:
+            clip_info = {"mediaPoolItem": mpi, "startFrame": s_start, "endFrame": s_end,
+                         "recordFrame": record, "trackIndex": track, "mediaType": media_type}
+            landed, _, attempt = _slip_append(mp, tl, clip_info, duration=duration, ratio=ratio,
+                                              mpi_id=mpi_id, resolve=resolve, track_type=track_type)
+            attempts.append(attempt)
+            if landed is None:
+                return pieces, attempts, False
+            pieces.append(landed)
+        return pieces, attempts, True
+
+    def _carry(source, targets, key):
+        if track_type != "video":
+            return
+        steps[key] = [{"grades": _copy_grades_checked(source, t, resolve),
+                       "properties": _copy_duplicate_item_state(source, t, list(_SLIP_COPY_GROUPS))}
+                      for t in targets]
+
+    count_before = _timeline_track_count(tl, track_type)
+    if not tl.AddTrack(track_type) or _timeline_track_count(tl, track_type) != count_before + 1:
+        return None, steps, _err(f"Could not add a temporary {track_type} track",
+                                 code="ADD_TRACK_FAILED", category="api_error", state=steps)
+    temp_index = count_before + 1
+    temps, steps["temp_append"], ok = _place(temp_index)
+    if not ok:
+        if temps:
+            _timeline_delete_clips_verified(tl, temps, False, resolve=resolve)
+        steps["temp_track_removed"] = bool(tl.DeleteTrack(track_type, temp_index))
+        return None, steps, _err(f"The {track_type} pieces could not be placed; nothing was changed",
+                                 code="SPLIT_APPEND_FAILED", category="api_error", state=steps)
+    _carry(item, temps, "to_temp")
+    if not _timeline_delete_clips_verified(tl, [item], False, resolve=resolve):
+        steps["temp_removed"] = bool(_timeline_delete_clips_verified(tl, temps, False, resolve=resolve))
+        steps["temp_track_removed"] = bool(tl.DeleteTrack(track_type, temp_index))
+        return None, steps, _err(f"DeleteClips refused the original {track_type} item; it is as it was",
+                                 code="SPLIT_DELETE_FAILED", category="api_error", state=steps)
+    steps["original_deleted"] = True
+    finals, steps["final_append"], ok = _place(track_index)
+    if not ok:
+        return None, steps, _err(
+            f"The original {track_type} item was deleted but the final pieces could not be placed. "
+            f"The temporary pieces on {track_type} track {temp_index} carry the cut with the grade "
+            "and sizing: move them down, or restore the archived timeline version.",
+            code="SPLIT_FINAL_APPEND_FAILED", category="api_error", retryable=False,
+            state={**steps, "recovery": {"temp_track": f"{track_type}:{temp_index}",
+                                         "temp_item_ids": [_safe_timeline_item_id(t) for t in temps]}})
+    _carry(temps[0], finals[:1], "to_final_a")
+    _carry(temps[1], finals[1:], "to_final_b")
+    steps["temp_removed"] = bool(_timeline_delete_clips_verified(tl, temps, False, resolve=resolve))
+    steps["temp_track_removed"] = bool(tl.DeleteTrack(track_type, temp_index))
+    return finals, steps, None
+
+
+def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
+    """Razor: cut a timeline item (and its linked audio) in two at a record frame.
+
+    Resolve's scripting API has no split/razor. This rebuilds each item spanning the
+    cut as two pieces with _split_rebuild_one (temporary track, grade + properties
+    carried twice, original deleted, final pieces on the original track), unlinking
+    video and audio first and relinking piece A with A and B with B after.
+
+    Params: timeline_item_id; the cut as ``frame`` (absolute record frame, as
+    GetStart reports) or ``offset`` (frames from the item start); include_linked
+    (default true: cut linked audio too); unlock_track; dry_run; confirm_token.
+    Blocked: a cut outside the item, Fusion comps (not carried), retime (source
+    math would be wrong), locked tracks without unlock_track.
+    """
+    item_id = p.get("timeline_item_id") or p.get("timelineItemId") or p.get("clip_id")
+    if not item_id:
+        return _err("split_item requires timeline_item_id",
+                    code="MISSING_TIMELINE_ITEM_ID", category="invalid_input")
+    item = _find_timeline_item_by_id(tl, item_id)
+    if item is None:
+        return _err(f"No timeline item with id {item_id!r}", code="ITEM_NOT_FOUND", category="invalid_input")
+    track_info, track_err = _timeline_item_track_info(item)
+    if track_err:
+        return track_err
+    if _timeline_item_media_pool_item(item) is None:
+        return _err("The item has no Media Pool clip (a title or generator), so it cannot be re-appended",
+                    code="NO_MEDIA_POOL_ITEM", category="unsupported")
+    start, end = _frame_int(item.GetStart()), _frame_int(item.GetEnd())
+    if start is None or end is None or _timeline_item_source_start(item) is None:
+        return _err("Could not read the item's record or source range",
+                    code="ITEM_UNREADABLE", category="api_error")
+    if p.get("frame") is not None:
+        cut = _frame_int(p["frame"])
+    elif p.get("offset") is not None:
+        cut = start + int(p["offset"])
+    else:
+        return _err("Pass frame (absolute record frame) or offset (frames from the item start)",
+                    code="MISSING_CUT", category="invalid_input")
+    if cut is None or not (start < cut < end):
+        return _err(f"The cut {cut!r} is not inside the item ({start}..{end})",
+                    code="CUT_OUTSIDE_ITEM", category="invalid_input")
+
+    linked = []
+    try:
+        all_linked = list(item.GetLinkedItems() or []) if _has_method(item, "GetLinkedItems") else []
+    except Exception:
+        all_linked = []
+    if _coerce_bool(p.get("include_linked"), True):
+        for other in all_linked:
+            info, _ = _timeline_item_track_info(other)
+            o_start, o_end = _frame_int(other.GetStart()), _frame_int(other.GetEnd())
+            if info and info != track_info and o_start is not None and o_end is not None \
+                    and o_start < cut < o_end and _timeline_item_media_pool_item(other) is not None:
+                linked.append(other)
+    targets = [item] + linked
+
+    blockers = []
+    for target in targets:
+        try:
+            comps = int(target.GetFusionCompCount() or 0) if _has_method(target, "GetFusionCompCount") else 0
+        except Exception:
+            comps = 0
+        if comps:
+            blockers.append(f"{_safe_timeline_item_id(target)} carries {comps} Fusion comp(s), which the rebuild does not carry")
+        try:
+            speed = target.GetSpeed() if _has_method(target, "GetSpeed") else None
+        except Exception:
+            speed = None
+        if isinstance(speed, dict) and speed.get("Percentage") not in (None, 100, 100.0):
+            blockers.append(f"{_safe_timeline_item_id(target)} is retimed ({speed.get('Percentage')}%), "
+                            "so the source frames of the pieces cannot be derived")
+    tracks = _items_tracks(targets)
+    locked = _timeline_locked_tracks(tl, tracks)
+    unlock = _coerce_bool(p.get("unlock_track"))
+    plan = {
+        "timeline_item_id": str(item_id),
+        "track": f"{track_info[0]}:{track_info[1]}",
+        "record": {"start": start, "end": end},
+        "cut_frame": cut,
+        "pieces": {"a": {"start": start, "end": cut}, "b": {"start": cut, "end": end}},
+        "linked_audio": [_safe_timeline_item_id(i) for i in linked],
+        "left_unlinked": [_safe_timeline_item_id(i) for i in all_linked if i not in linked],
+        "carried": ["grades"] + list(_SLIP_COPY_GROUPS),
+        "not_carried": ["retime", "Inspector keyframes", "Fusion comps", "transitions", "audio levels"],
+        "track_locked": locked,
+        "blockers": blockers,
+    }
+    if locked and not unlock:
+        return _track_locked_refusal(locked, "split_item",
+                                     extra_remediation="Or pass unlock_track=true: the tracks are unlocked "
+                                                       "for the cut and locked again afterwards.")
+    if _coerce_bool(p.get("dry_run")):
+        return {"success": not blockers, "dry_run": True, "plan": plan}
+    if blockers:
+        return _err("; ".join(blockers), code="SPLIT_BLOCKED", category="precondition", state={"plan": plan})
+    refused = _playback_refusal(p, "split_item", tl=tl)
+    if refused:
+        return refused
+    if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
+        return _issue_confirm_token(
+            action="timeline.split_item", params=p,
+            preview={"operation": "timeline.split_item",
+                     "warning": "Deletes the item (and linked audio) and re-appends it as two pieces; "
+                                "grade and sizing are carried, retime, keyframes and Fusion are not.",
+                     **plan})
+    blocked = _consume_confirm_token(action="timeline.split_item", params=p)
+    if blocked:
+        return blocked
+
+    mp = proj.GetMediaPool()
+    if not mp:
+        return _err("Failed to get MediaPool")
+    tl_fps, _fps_err = _timeline_fps(tl)
+    report: Dict[str, Any] = {"plan": plan, "steps": {}}
+    unlocked = []
+    page_guard = _edit_page_for_timeline_edits(resolve) if resolve is not None else contextlib.nullcontext()
+    pieces: Dict[str, List[Any]] = {}
+    try:
+        with page_guard:
+            for name in locked:
+                t_type, t_index = name.split(":")
+                if tl.SetTrackLock(t_type, int(t_index), False):
+                    unlocked.append((t_type, int(t_index)))
+            if all_linked:
+                # Deleting a linked item takes its partners with it, so every link is
+                # broken first; items left out of the cut stay whole and unlinked.
+                try:
+                    report["unlinked"] = bool(tl.SetClipsLinked([item] + all_linked, False))
+                except Exception as exc:
+                    report["unlinked"] = f"SetClipsLinked failed: {exc}"
+            for target in targets:
+                t_info, _ = _timeline_item_track_info(target)
+                media_fps = _media_item_source_fps(_timeline_item_media_pool_item(target))
+                ratio = (media_fps / tl_fps) if (tl_fps and media_fps) else 1.0
+                key = f"{t_info[0]}:{t_info[1]}"
+                done, report["steps"][key], err = _split_rebuild_one(
+                    mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve)
+                if err:
+                    if pieces:
+                        err.setdefault("error", {}).setdefault("state", {})["already_split"] = {
+                            k: [_safe_timeline_item_id(i) for i in v] for k, v in pieces.items()}
+                    return err
+                pieces[key] = done
+            if len(pieces) > 1:
+                report["relinked"] = {}
+                for idx, label in ((0, "a"), (1, "b")):
+                    group = [v[idx] for v in pieces.values()]
+                    try:
+                        report["relinked"][label] = bool(tl.SetClipsLinked(group, True))
+                    except Exception as exc:
+                        report["relinked"][label] = f"SetClipsLinked failed: {exc}"
+    finally:
+        if unlocked:
+            report["tracks_relocked"] = [bool(tl.SetTrackLock(t, i, True)) for t, i in unlocked]
+
+    expected = [(start, cut), (cut, end)]
+    verified = all(
+        [(_frame_int(x.GetStart()), _frame_int(x.GetEnd())) for x in v] == expected for v in pieces.values())
+    main = pieces[f"{track_info[0]}:{track_info[1]}"]
+
+    def _summary(piece):
+        return {"timeline_item_id": _safe_timeline_item_id(piece), "start": _frame_int(piece.GetStart()),
+                "end": _frame_int(piece.GetEnd()), "source_start": _timeline_item_source_start(piece)}
+
+    return {
+        "success": True,
+        "verified": verified,
+        "cut_frame": cut,
+        "pieces": {"a": _summary(main[0]), "b": _summary(main[1])},
+        "linked_pieces": {k: [_summary(x) for x in v] for k, v in pieces.items() if k != f"{track_info[0]}:{track_info[1]}"},
+        **report,
+    }
+
+
 def _timeline_copy_range_impl(proj, tl, p: Dict[str, Any], *, overwrite: bool = False, resolve=None):
     start, end, items, err = _collect_timeline_items_in_range(tl, p)
     if err:
@@ -6920,7 +7171,7 @@ def _timeline_edit_kernel_capabilities():
                 "after_source",
                 "next_gap",
             ],
-            "clip_operations": ["copy_clips", "move_clips"],
+            "clip_operations": ["copy_clips", "move_clips", "split_item"],
             "range_operations": [
                 "copy_range",
                 "duplicate_range",
@@ -6949,7 +7200,7 @@ def _timeline_edit_kernel_capabilities():
         },
         "unsupported": {
             "transition_cloning": "Resolve's public scripting API does not expose timeline item transition cloning.",
-            "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; partial range edits are represented by append-based copies or whole-item deletes.",
+            "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; split_item emulates it by rebuilding the item as two pieces (grade and sizing carried; retime, keyframes and Fusion comps are not).",
             "source_less_items": "Titles, generators, Fusion compositions, and subtitles without a MediaPoolItem cannot be cloned through AppendToTimeline clipInfo.",
             "deep_speed_ramp_semantics": "Only exposed Speed/RetimeProcess/MotionEstimation properties and supported keyframes are copied; opaque retime curves are not independently inspectable.",
         },
@@ -27590,7 +27841,7 @@ _TIMELINE_ACTIONS = [
     "add_track", "delete_track", "get_track_sub_type", "set_track_enable",
     "get_track_enabled", "set_track_lock", "get_track_locked", "get_track_name",
     "set_track_name", "get_items", "delete_clips", "set_clips_linked", "duplicate",
-    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "copy_range", "duplicate_range",
+    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_range", "duplicate_range",
     "overwrite_range", "lift_range", "story_spine_report", "create_variant_from_ranges",
     "bulk_set_item_properties", "apply_look_to_items", "thumbnail_contact_sheet",
     "marker_thumbnail_review", "edit_kernel_capabilities", "probe_edit_kernel_item",
@@ -27686,6 +27937,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         (AppendToTimeline can return null-id items, e.g. into an occupied span).
         NEVER use move_clips to open a gap for an insert — that is what ripple_insert is for.
       replace_source_range(timeline_item_id, source_start|slip_frames, source_end?, unlock_track?, ignore_linked?, dry_run?, confirm_token?) -> {success, verified, timing, steps}
+      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
         Slip a video item to a new source range at the same record frame, keeping grade,
         transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
         temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->
@@ -28150,6 +28402,8 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         return _timeline_ripple_insert_impl(proj, tl, p, resolve=get_resolve())
     elif action == "replace_source_range":
         return _timeline_replace_source_range_impl(proj, tl, p, resolve=get_resolve())
+    elif action == "split_item":
+        return _timeline_split_item_impl(proj, tl, p, resolve=get_resolve())
     elif action in {"copy_range", "duplicate_range"}:
         return _timeline_copy_range_impl(proj, tl, p)
     elif action == "overwrite_range":

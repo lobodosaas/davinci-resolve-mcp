@@ -172,6 +172,9 @@ class RiskClassificationHook(LifecycleHook):
         # range; grade and sizing are carried, retime and Inspector keyframes
         # are not. Same rebuild shape as move_clips.
         ("timeline", "replace_source_range"),
+        # A split deletes the item (and linked audio) and re-appends it as two
+        # pieces; same rebuild shape as replace_source_range.
+        ("timeline", "split_item"),
         ("timeline", "create_compound_clip"),
         ("timeline", "create_fusion_clip"),
         # ImportIntoTimeline lays an external edit over the timeline;
