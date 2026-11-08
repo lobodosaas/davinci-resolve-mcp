@@ -183,7 +183,7 @@ def save_project() -> str:
     
     Note that DaVinci Resolve typically auto-saves projects, so this may not be necessary.
     """
-    pm, current_project = get_current_project()
+    project_manager, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
     
@@ -259,7 +259,7 @@ def close_project() -> str:
     
     This closes the current project without saving. If you need to save, use the save_project function first.
     """
-    pm, current_project = get_current_project()
+    project_manager, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
     
@@ -312,34 +312,23 @@ def get_cache_settings() -> Dict[str, Any]:
 @mcp.tool()
 @granular_destructive_op()
 def set_cache_mode(mode: str) -> str:
-    """Set cache mode for the current project.
-    
+    """Set the render cache mode for the current project (Playback > Render Cache).
+
     Args:
-        mode: Cache mode to set. Options: 'auto', 'on', 'off'
+        mode: 'none', 'smart' or 'user' (native perfRenderCacheMode values).
+            Legacy aliases: 'off' -> none, 'auto' -> smart, 'on' -> user.
     """
     pm, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
-    
-    # Validate mode
-    valid_modes = ["auto", "on", "off"]
-    mode = mode.lower()
-    if mode not in valid_modes:
-        return f"Error: Invalid cache mode. Must be one of: {', '.join(valid_modes)}"
-    
-    # Convert mode to API value
-    mode_map = {
-        "auto": "0",
-        "on": "1",
-        "off": "2"
-    }
-    
+    choices = {"none": "none", "smart": "smart", "user": "user", "off": "none", "auto": "smart", "on": "user"}
+    value = choices.get(str(mode).strip())
+    if value is None:
+        return f"Error: Invalid cache mode. Must be one of: {', '.join(choices)}"
     try:
-        result = current_project.SetSetting("CacheMode", mode_map[mode])
-        if result:
-            return f"Successfully set cache mode to '{mode}'"
-        else:
-            return f"Failed to set cache mode to '{mode}'"
+        if current_project.SetSetting("perfRenderCacheMode", value) and str(current_project.GetSetting("perfRenderCacheMode")) == value:
+            return f"Successfully set cache mode to '{mode}' (perfRenderCacheMode={value})"
+        return f"Failed to set cache mode to '{mode}' (perfRenderCacheMode={value})"
     except Exception as e:
         return f"Error setting cache mode: {str(e)}"
 
@@ -347,34 +336,22 @@ def set_cache_mode(mode: str) -> str:
 @mcp.tool()
 @granular_destructive_op()
 def set_optimized_media_mode(mode: str) -> str:
-    """Set optimized media mode for the current project.
-    
+    """Enable or disable optimized media for the current project.
+
     Args:
-        mode: Optimized media mode to set. Options: 'auto', 'on', 'off'
+        mode: 'on' or 'off' (native perfOptimisedMediaOn '1'/'0').
     """
     pm, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
-    
-    # Validate mode
-    valid_modes = ["auto", "on", "off"]
-    mode = mode.lower()
-    if mode not in valid_modes:
-        return f"Error: Invalid optimized media mode. Must be one of: {', '.join(valid_modes)}"
-    
-    # Convert mode to API value
-    mode_map = {
-        "auto": "0",
-        "on": "1",
-        "off": "2"
-    }
-    
+    choices = {"on": "1", "off": "0", "1": "1", "0": "0"}
+    value = choices.get(str(mode).strip())
+    if value is None:
+        return f"Error: Invalid optimized media mode. Must be one of: {', '.join(choices)}"
     try:
-        result = current_project.SetSetting("OptimizedMediaMode", mode_map[mode])
-        if result:
-            return f"Successfully set optimized media mode to '{mode}'"
-        else:
-            return f"Failed to set optimized media mode to '{mode}'"
+        if current_project.SetSetting("perfOptimisedMediaOn", value) and str(current_project.GetSetting("perfOptimisedMediaOn")) == value:
+            return f"Successfully set optimized media mode to '{mode}' (perfOptimisedMediaOn={value})"
+        return f"Failed to set optimized media mode to '{mode}' (perfOptimisedMediaOn={value})"
     except Exception as e:
         return f"Error setting optimized media mode: {str(e)}"
 
@@ -382,34 +359,23 @@ def set_optimized_media_mode(mode: str) -> str:
 @mcp.tool()
 @granular_destructive_op()
 def set_proxy_mode(mode: str) -> str:
-    """Set proxy media mode for the current project.
-    
+    """Set when proxy media is used for the current project.
+
     Args:
-        mode: Proxy mode to set. Options: 'auto', 'on', 'off'
+        mode: 'off' (disabled), 'when_available' or 'when_source_unavailable'
+            (native perfProxyMediaMode '0'/'1'/'2'). 'on' is an alias of 'when_available'.
     """
     pm, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
-    
-    # Validate mode
-    valid_modes = ["auto", "on", "off"]
-    mode = mode.lower()
-    if mode not in valid_modes:
-        return f"Error: Invalid proxy mode. Must be one of: {', '.join(valid_modes)}"
-    
-    # Convert mode to API value
-    mode_map = {
-        "auto": "0",
-        "on": "1",
-        "off": "2"
-    }
-    
+    choices = {"off": "0", "when_available": "1", "when_source_unavailable": "2", "on": "1", "0": "0", "1": "1", "2": "2"}
+    value = choices.get(str(mode).strip())
+    if value is None:
+        return f"Error: Invalid proxy mode. Must be one of: {', '.join(choices)}"
     try:
-        result = current_project.SetSetting("ProxyMode", mode_map[mode])
-        if result:
-            return f"Successfully set proxy mode to '{mode}'"
-        else:
-            return f"Failed to set proxy mode to '{mode}'"
+        if current_project.SetSetting("perfProxyMediaMode", value) and str(current_project.GetSetting("perfProxyMediaMode")) == value:
+            return f"Successfully set proxy mode to '{mode}' (perfProxyMediaMode={value})"
+        return f"Failed to set proxy mode to '{mode}' (perfProxyMediaMode={value})"
     except Exception as e:
         return f"Error setting proxy mode: {str(e)}"
 
@@ -417,34 +383,23 @@ def set_proxy_mode(mode: str) -> str:
 @mcp.tool()
 @granular_destructive_op()
 def set_proxy_quality(quality: str) -> str:
-    """Set proxy media quality for the current project.
-    
+    """Set the proxy media resolution for the current project.
+
     Args:
-        quality: Proxy quality to set. Options: 'quarter', 'half', 'threeQuarter', 'full'
+        quality: 'original', 'half' or 'quarter' (native perfProxyResolutionRatio).
+            'full' is an alias of 'original'.
     """
     pm, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
-    
-    # Validate quality
-    valid_qualities = ["quarter", "half", "threeQuarter", "full"]
-    if quality not in valid_qualities:
-        return f"Error: Invalid proxy quality. Must be one of: {', '.join(valid_qualities)}"
-    
-    # Convert quality to API value
-    quality_map = {
-        "quarter": "0",
-        "half": "1",
-        "threeQuarter": "2",
-        "full": "3"
-    }
-    
+    choices = {"original": "original", "half": "half", "quarter": "quarter", "full": "original"}
+    value = choices.get(str(quality).strip())
+    if value is None:
+        return f"Error: Invalid proxy quality. Must be one of: {', '.join(choices)}"
     try:
-        result = current_project.SetSetting("ProxyQuality", quality_map[quality])
-        if result:
-            return f"Successfully set proxy quality to '{quality}'"
-        else:
-            return f"Failed to set proxy quality to '{quality}'"
+        if current_project.SetSetting("perfProxyResolutionRatio", value) and str(current_project.GetSetting("perfProxyResolutionRatio")) == value:
+            return f"Successfully set proxy quality to '{quality}' (perfProxyResolutionRatio={value})"
+        return f"Failed to set proxy quality to '{quality}' (perfProxyResolutionRatio={value})"
     except Exception as e:
         return f"Error setting proxy quality: {str(e)}"
 
@@ -670,31 +625,24 @@ def get_superscale_settings_endpoint() -> Dict[str, Any]:
 
 @mcp.tool()
 @granular_destructive_op()
-def set_superscale_settings_tool(enabled: bool, quality: int = 0) -> str:
-    """Set SuperScale settings for the current project.
-    
+def set_superscale_settings_tool(enabled: bool, quality: int = 0, scale: int = 2) -> str:
+    """Set the project SuperScale multiplier (native ``superScale``).
+
     Args:
-        enabled: Whether SuperScale is enabled
-        quality: SuperScale quality (0=Auto, 1=Better Quality, 2=Smoother)
+        enabled: False sets SuperScale to none; True applies ``scale``.
+        quality: Deprecated and ignored (Resolve 21.1 has no such project setting).
+        scale: 0=Auto, 2=2x, 3=3x, 4=4x. Default 2.
     """
     pm, current_project = get_current_project()
     if not current_project:
         return "Error: No project currently open"
-    
-    quality_names = {
-        0: "Auto",
-        1: "Better Quality",
-        2: "Smoother"
-    }
-    
-    result = set_superscale_settings(current_project, enabled, quality)
-    
-    if result:
-        status = "enabled" if enabled else "disabled"
-        quality_name = quality_names.get(quality, "Unknown")
-        return f"Successfully {status} SuperScale with quality set to {quality_name}"
-    else:
-        return "Failed to set SuperScale settings"
+    if enabled and scale not in (0, 2, 3, 4):
+        return "Error: scale must be 0 (Auto), 2, 3 or 4"
+    value = scale if enabled else 1
+    if set_superscale_settings(current_project, enabled, scale):
+        label = {0: "Auto", 1: "none", 2: "2x", 3: "3x", 4: "4x"}[value]
+        return f"Successfully set SuperScale to {label} (superScale={value})"
+    return "Failed to set SuperScale settings"
 
 
 @mcp.resource("resolve://project/color-settings")
@@ -1635,6 +1583,11 @@ def render_with_quick_export(
         return {"success": False, "preset_name": preset_name, "error": "RenderWithQuickExport returned no status"}
     if isinstance(result, str):
         return {"success": False, "preset_name": preset_name, "error": result}
+    # Resolve hands back a status dict even when the job fails at once
+    # (measured on 21.1.1: {"JobStatus": "Render Failed", "Error": "Invalid quick export preset name"}).
+    if isinstance(result, dict) and (result.get("Error") or str(result.get("JobStatus", "")).lower() in ("render failed", "failed", "cancelled")):
+        return {"success": False, "preset_name": preset_name, "status": result,
+                "error": result.get("Error") or result.get("JobStatus")}
     return {"success": True, "preset_name": preset_name, "status": result}
 
 
