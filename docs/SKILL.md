@@ -2613,6 +2613,17 @@ are carried (comps are exported to `work_dir`, which must be Resolve-writable);
 reversed or frozen items are refused, and speed ramps are not carried. Confirm-token gated, `dry_run=true`
 returns the plan. Trim = split, then `lift_range` the unwanted piece.
 
+**Captions on any track** — `InsertFusionTitleIntoTimeline` only lands on V1
+of the current timeline. `timeline(action="add_captions", params={"segments":
+[{"start": 1.0, "end": 2.5, "text": "..."}]})` (seconds from the timeline start),
+or `{"clip_id": <transcribed clip>, "record_offset": s, "max_words": 3}` to chunk
+the clip's word transcription, puts each caption in its own Text+ timeline in
+the `MCP Captions` bin and appends it onto `track_index` (default: a new video
+track on top) at its frame; captions longer than the 5 s title are cut into
+pieces of the same inner timeline. `style` sets `font`, `size`, `color` [r,g,b]
+0-1 and vertical `position` 0-1. `timeline(action="set_caption_text",
+params={"timeline_item_id": ..., "text": ...})` rewrites one caption.
+
 **Copying a transition** (Resolve 21.1+) — there is no clone verb, and only a
 transition's name and frame range are readable.
 `timeline(action="copy_transition", params={"transition_id": ..., "before_item_id": ...})`

@@ -7221,6 +7221,275 @@ def _timeline_copy_transition_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": True, "verified": verified, "transition": got, "plan": plan}
 
 
+_CAPTION_FOLDER = "MCP Captions"
+_CAPTION_SKIP_WORDS = {"(...)", "...", ""}
+
+
+def _caption_tc_frames(tc: Any, fps: float) -> Optional[int]:
+    """HH:MM:SS:FF (transcription word timecode) to a frame count."""
+    try:
+        h, m, sec, f = (int(x) for x in str(tc).replace(";", ":").split(":"))
+    except (TypeError, ValueError):
+        return None
+    return int(round((h * 3600 + m * 60 + sec) * fps)) + f
+
+
+def _captions_from_transcription(clip, max_words: int, record_offset: float):
+    """Short captions [{start, end, text}] (seconds on the timeline) from a clip's
+    word-level transcription. Word timecodes are clip-relative (measured on
+    21.1.1: the first word of a 0-TC clip at 00:00:00:03); a clip whose Start TC
+    is not zero has it subtracted when the words sit past it. Filler tokens
+    such as "(...)" are dropped; a pause of more than 1 s also ends a caption."""
+    data = clip.GetTranscription() if _has_method(clip, "GetTranscription") else None
+    if not isinstance(data, dict) or not data.get("segments"):
+        return None, _err("The clip has no transcription; run media_pool_item transcribe_audio first",
+                          code="NO_TRANSCRIPTION", category="precondition")
+    match = re.search(r"\d+(?:\.\d+)?", str(clip.GetClipProperty("FPS") or ""))
+    fps = float(match.group(0)) if match else 24.0
+    tc0 = _caption_tc_frames(clip.GetClipProperty("Start TC") or "00:00:00:00", fps) or 0
+    words = []
+    for segment in data.get("segments") or []:
+        for word in segment.get("words") or []:
+            text = str(word.get("text") or "").strip()
+            a, b = _caption_tc_frames(word.get("start"), fps), _caption_tc_frames(word.get("end"), fps)
+            if text in _CAPTION_SKIP_WORDS or a is None or b is None:
+                continue
+            words.append((a, b, text))
+    if tc0 and words and min(w[0] for w in words) >= tc0:
+        words = [(a - tc0, b - tc0, t) for a, b, t in words]
+    captions, chunk = [], []
+
+    def _flush():
+        if chunk:
+            captions.append({"start": record_offset + chunk[0][0] / fps,
+                             "end": record_offset + chunk[-1][1] / fps,
+                             "text": " ".join(w[2] for w in chunk)})
+            chunk.clear()
+
+    for word in words:
+        if chunk and (len(chunk) >= max_words or word[0] - chunk[-1][1] > fps):
+            _flush()
+        chunk.append(word)
+    _flush()
+    if not captions:
+        return None, _err("The transcription has no words", code="NO_TRANSCRIPTION", category="precondition")
+    return captions, None
+
+
+def _caption_text_tool(inner_tl):
+    """The TextPlus tool of the title on V1 of a caption's inner timeline."""
+    items = inner_tl.GetItemListInTrack("video", 1) or []
+    if not items:
+        return None
+    comp = items[0].GetFusionCompByIndex(1)
+    tools = list((comp.GetToolList(False, "TextPlus") or {}).values()) if comp else []
+    return tools[0] if tools else None
+
+
+def _caption_style_inputs(style: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    if not style:
+        return {}, None
+    if not isinstance(style, dict):
+        return {}, _err("style must be an object {font?, size?, color?, position?}",
+                        code="INVALID_STYLE", category="invalid_input")
+    inputs: Dict[str, Any] = {}
+    if style.get("font"):
+        inputs["Font"] = str(style["font"])
+    if style.get("size") is not None:
+        inputs["Size"] = float(style["size"])
+    color = style.get("color")
+    if color is not None:
+        if not isinstance(color, (list, tuple)) or len(color) != 3:
+            return {}, _err("style.color must be [r, g, b] in 0-1", code="INVALID_STYLE", category="invalid_input")
+        inputs.update({"Red1": float(color[0]), "Green1": float(color[1]), "Blue1": float(color[2])})
+    position = style.get("position", style.get("vertical_position"))
+    if position is not None:
+        inputs["Center"] = {1: 0.5, 2: float(position)}
+    return inputs, None
+
+
+def _timeline_add_captions_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
+    """Burned-in style captions as Text+ titles on a chosen video track.
+
+    InsertFusionTitleIntoTimeline only lands on V1 of the current timeline (no
+    track selector; a locked V1 makes it fail — api_truth). So each caption is a
+    Text+ inside its own timeline in the Media Pool folder "MCP Captions"; that
+    timeline's Media Pool item is appended onto the caption track at the
+    caption's record frame (startFrame 0, endFrame = duration; measured on
+    21.1.1 to land exactly). The title is 5 s by default, so a longer caption is
+    cut into consecutive pieces of the same inner timeline. The user's current
+    timeline and Media Pool folder are restored.
+
+    Params: segments [{start, end, text}] in seconds from the timeline start, OR
+    clip_id of a transcribed Media Pool clip (+ record_offset seconds, max_words
+    default 3); track_index (default: a new video track above the highest);
+    style {font, size, color [r,g,b] 0-1, position (vertical, 0-1)}; dry_run.
+    """
+    max_words = p.get("max_words", 3)
+    if type(max_words) is not int or max_words < 1:
+        return _err("max_words must be a positive integer", code="INVALID_MAX_WORDS", category="invalid_input")
+    fps, fps_err = _timeline_fps(tl)
+    if fps_err:
+        return fps_err
+    mp = proj.GetMediaPool()
+    if p.get("segments") is not None:
+        segments = p["segments"]
+        if not isinstance(segments, list) or not segments:
+            return _err("segments must be a non-empty list of {start, end, text}",
+                        code="INVALID_SEGMENTS", category="invalid_input")
+    elif p.get("clip_id"):
+        clip = _find_clip(mp.GetRootFolder(), p["clip_id"])
+        if clip is None:
+            return _err(f"No Media Pool clip {p['clip_id']!r}", code="CLIP_NOT_FOUND", category="invalid_input")
+        try:
+            offset = float(p.get("record_offset") or 0)
+        except (TypeError, ValueError):
+            return _err("record_offset must be seconds", code="INVALID_SEGMENTS", category="invalid_input")
+        segments, err = _captions_from_transcription(clip, max_words, offset)
+        if err:
+            return err
+    else:
+        return _err("Pass segments or clip_id (a transcribed Media Pool clip)",
+                    code="MISSING_CAPTIONS", category="invalid_input")
+
+    start0 = _frame_int(tl.GetStartFrame())
+    captions, last_end = [], None
+    for index, seg in enumerate(segments):
+        where = f"segments[{index}]"
+        if not isinstance(seg, dict) or not str(seg.get("text") or "").strip():
+            return _err(f"{where} needs non-empty text", code="INVALID_SEGMENTS", category="invalid_input")
+        try:
+            a, b = float(seg["start"]), float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            return _err(f"{where} needs numeric start and end (seconds)", code="INVALID_SEGMENTS",
+                        category="invalid_input")
+        fa, fb = int(round(a * fps)), int(round(b * fps))
+        if a < 0 or fb <= fa:
+            return _err(f"{where}: start must be >= 0 and end after start", code="INVALID_SEGMENTS",
+                        category="invalid_input")
+        if last_end is not None and fa < last_end:
+            return _err(f"{where} overlaps the previous caption", code="INVALID_SEGMENTS",
+                        category="invalid_input")
+        last_end = fb
+        captions.append({"index": index, "text": str(seg["text"]).strip(), "start": a, "end": b,
+                         "record_start": start0 + fa, "record_end": start0 + fb})
+    style_inputs, style_err = _caption_style_inputs(p.get("style"))
+    if style_err:
+        return style_err
+
+    video_tracks = int(tl.GetTrackCount("video") or 0)
+    track_index = p.get("track_index")
+    if track_index is not None:
+        if type(track_index) is not int or not 1 <= track_index <= video_tracks:
+            return _err(f"track_index must be an existing video track (1..{video_tracks})",
+                        code="INVALID_TRACK", category="invalid_input")
+        busy = [c["index"] for c in captions for it in (tl.GetItemListInTrack("video", track_index) or [])
+                if _frame_int(it.GetStart()) < c["record_end"] and c["record_start"] < _frame_int(it.GetEnd())]
+        if busy:
+            return _err(f"Video track {track_index} is occupied under caption(s) {sorted(set(busy))}; "
+                        "an append there lands nothing. Omit track_index for a new track.",
+                        code="CAPTION_TRACK_OCCUPIED", category="precondition")
+        locked = _timeline_locked_tracks(tl, [("video", track_index)])
+        if locked:
+            return _track_locked_refusal(locked, "add_captions")
+    plan = {"captions": captions, "track_index": track_index or video_tracks + 1,
+            "new_track": track_index is None, "folder": _CAPTION_FOLDER, "style": style_inputs}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+    refused = _playback_refusal(p, "add_captions", tl=tl)
+    if refused:
+        return refused
+
+    if track_index is None:
+        if not tl.AddTrack("video") or int(tl.GetTrackCount("video") or 0) != video_tracks + 1:
+            return _err("Could not add a video track for the captions", code="ADD_TRACK_FAILED",
+                        category="api_error")
+        track_index = video_tracks + 1
+    root = mp.GetRootFolder()
+    folder = next((f for f in (root.GetSubFolderList() or []) if f.GetName() == _CAPTION_FOLDER), None) \
+        or mp.AddSubFolder(root, _CAPTION_FOLDER)
+    if not folder:
+        return _err(f"Could not create the Media Pool folder {_CAPTION_FOLDER!r}", code="FOLDER_FAILED",
+                    category="api_error")
+    previous_folder = mp.GetCurrentFolder()
+    stamp = time.strftime("%H%M%S")
+    placed_all: List[Dict[str, Any]] = []
+    verified = True
+    try:
+        for cap in captions:
+            mp.SetCurrentFolder(folder)
+            inner = mp.CreateEmptyTimeline(f"MCP Caption {stamp} {cap['index'] + 1:03d}")
+            if not inner:
+                return _err("CreateEmptyTimeline failed for a caption", code="CAPTION_TIMELINE_FAILED",
+                            category="api_error", state={"placed": placed_all})
+            proj.SetCurrentTimeline(inner)
+            title = inner.InsertFusionTitleIntoTimeline("Text+")
+            text_tool = _caption_text_tool(inner) if title else None
+            if text_tool is None:
+                proj.SetCurrentTimeline(tl)
+                return _err("Could not insert a Text+ title into the caption timeline",
+                            code="CAPTION_TITLE_FAILED", category="api_error", state={"placed": placed_all})
+            text_tool.SetInput("StyledText", cap["text"])
+            for key, value in style_inputs.items():
+                text_tool.SetInput(key, value)
+            title_frames = _frame_int(title.GetDuration()) or 0
+            proj.SetCurrentTimeline(tl)
+            inner_mpi = inner.GetMediaPoolItem()
+            cap["items"] = []
+            record = cap["record_start"]
+            while record < cap["record_end"]:
+                length = min(title_frames, cap["record_end"] - record) if title_frames else cap["record_end"] - record
+                landed = mp.AppendToTimeline([{"mediaPoolItem": inner_mpi, "startFrame": 0, "endFrame": length,
+                                               "trackIndex": track_index, "recordFrame": record}]) or []
+                item = landed[0] if landed else None
+                ok = bool(item) and _frame_int(item.GetStart()) == record and \
+                    _frame_int(item.GetEnd()) == record + length
+                verified = verified and ok
+                cap["items"].append({"timeline_item_id": _safe_timeline_item_id(item) if item else None,
+                                     "start": record, "end": record + length, "landed": ok})
+                record += length
+            cap["inner_timeline"] = inner.GetName()
+            placed_all.append(cap)
+    finally:
+        try:
+            proj.SetCurrentTimeline(tl)
+        except Exception:
+            pass
+        if previous_folder:
+            mp.SetCurrentFolder(previous_folder)
+    return {"success": verified, "verified": verified, "track_index": track_index,
+            "captions": placed_all, "folder": _CAPTION_FOLDER}
+
+
+def _timeline_set_caption_text_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Change the text of a caption placed by add_captions (its inner Text+).
+
+    Every piece of a caption longer than the title shares one inner timeline,
+    so they all change. dry_run returns the current text."""
+    item_id = p.get("timeline_item_id")
+    text = p.get("text")
+    if not item_id or not isinstance(text, str) or not text.strip():
+        return _err("set_caption_text requires timeline_item_id and non-empty text",
+                    code="INVALID_INPUT", category="invalid_input")
+    item = _find_timeline_item_by_id(tl, item_id)
+    if item is None:
+        return _err(f"No timeline item with id {item_id!r}", code="ITEM_NOT_FOUND", category="invalid_input")
+    mpi = item.GetMediaPoolItem()
+    inner = mpi.GetTimeline() if mpi is not None and _has_method(mpi, "GetTimeline") else None
+    tool = _caption_text_tool(inner) if inner else None
+    if tool is None:
+        return _err("The item is not a caption (no inner timeline with a Text+ title)",
+                    code="NOT_A_CAPTION", category="invalid_input")
+    current = tool.GetInput("StyledText")
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "current_text": current, "new_text": text,
+                "inner_timeline": inner.GetName()}
+    tool.SetInput("StyledText", text)
+    readback = tool.GetInput("StyledText")
+    return {"success": readback == text, "previous_text": current, "readback": readback,
+            "inner_timeline": inner.GetName()}
+
+
 def _timeline_copy_range_impl(proj, tl, p: Dict[str, Any], *, overwrite: bool = False, resolve=None):
     start, end, items, err = _collect_timeline_items_in_range(tl, p)
     if err:
@@ -28124,7 +28393,7 @@ _TIMELINE_ACTIONS = [
     "add_track", "delete_track", "get_track_sub_type", "set_track_enable",
     "get_track_enabled", "set_track_lock", "get_track_locked", "get_track_name",
     "set_track_name", "get_items", "delete_clips", "set_clips_linked", "duplicate",
-    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_transition", "copy_range", "duplicate_range",
+    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_transition", "add_captions", "set_caption_text", "copy_range", "duplicate_range",
     "overwrite_range", "lift_range", "story_spine_report", "create_variant_from_ranges",
     "bulk_set_item_properties", "apply_look_to_items", "thumbnail_contact_sheet",
     "marker_thumbnail_review", "edit_kernel_capabilities", "probe_edit_kernel_item",
@@ -28224,6 +28493,11 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
       copy_transition(transition_id, before_item_id|after_item_id, category?="simple", type?, dry_run?) -> {success, verified, transition{name,start,end,duration,alignment}, plan}
         Resolve 21.1+. Copies name, duration and alignment (inferred from the span vs its cut)
         onto the cut after before_item_id / before after_item_id; category is unreadable, default simple.
+      add_captions(segments=[{start,end,text}] | clip_id (+record_offset, max_words?=3), track_index?, style?{font,size,color[r,g,b],position}, dry_run?) -> {success, verified, track_index, captions[{text, items[{timeline_item_id,start,end}], inner_timeline}]}
+        Text+ captions on any video track (default: a new track on top). Seconds are from the
+        timeline start; clip_id chunks the clip's word transcription into max_words captions.
+        Each caption is a Text+ in its own timeline in the "MCP Captions" bin, appended at its frame.
+      set_caption_text(timeline_item_id, text, dry_run?) -> {success, previous_text, readback}
         Slip a video item to a new source range at the same record frame, keeping grade,
         transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
         temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->
@@ -28692,6 +28966,10 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         return _timeline_split_item_impl(proj, tl, p, resolve=get_resolve())
     elif action == "copy_transition":
         return _timeline_copy_transition_impl(tl, p)
+    elif action == "add_captions":
+        return _timeline_add_captions_impl(proj, tl, p, resolve=get_resolve())
+    elif action == "set_caption_text":
+        return _timeline_set_caption_text_impl(tl, p)
     elif action in {"copy_range", "duplicate_range"}:
         return _timeline_copy_range_impl(proj, tl, p)
     elif action == "overwrite_range":

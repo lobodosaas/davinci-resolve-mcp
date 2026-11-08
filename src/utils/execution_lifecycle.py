@@ -343,6 +343,10 @@ class RiskClassificationHook(LifecycleHook):
         ("timeline_item", "add_transition"),
         # copy_transition adds the same native transition at another cut.
         ("timeline", "copy_transition"),
+        # Captions add a track, bin timelines and title items; set_caption_text
+        # rewrites one caption's Text+.
+        ("timeline", "add_captions"),
+        ("timeline", "set_caption_text"),
         ("timeline_item", "set_speed"),
         ("timeline_item", "set_fades"),
         # Pool reorganisation: clips and bins move, nothing is destroyed, but
