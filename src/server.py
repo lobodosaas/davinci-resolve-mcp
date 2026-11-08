@@ -6773,13 +6773,21 @@ def _collect_timeline_items_in_range(tl, p: Dict[str, Any]):
     return start, end, items, None
 
 
-def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float, resolve=None):
+def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float, resolve=None,
+                       speed: float = 100.0, fusion_paths: Optional[List[str]] = None):
     """Rebuild one timeline item as two pieces cut at ``cut`` (absolute record frame).
 
     Same rebuild as replace_source_range, with two pieces: an AppendToTimeline onto an
     occupied record range lands nothing (measured on Studio 21.1.1), so the pieces go to
     a temporary track first, carry the grade and properties, the original goes, and the
     final pieces land on the original track. Returns (pieces [a, b] | None, steps, error).
+
+    Constant speed: the record length stays and the source advances at speed/100, so
+    piece B starts ``(cut - start) * speed/100`` source frames in. Each piece is appended
+    with a source span equal to its record length (so it lands at that length) and then
+    ``SetSpeed`` rescales its source — measured on 21.1.1, a 48-frame item at 50% from
+    source 0 cut at +24 gives source 0-12 and 12-24. ``fusion_paths`` (comps exported
+    from the original before it was deleted) are imported into both final pieces.
     """
     steps: Dict[str, Any] = {}
     info, _ = _timeline_item_track_info(item)
@@ -6789,9 +6797,11 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
     start, end = _frame_int(item.GetStart()), _frame_int(item.GetEnd())
     src0 = _timeline_item_source_start(item)
     media_type = 1 if track_type == "video" else 2
-    src_cut = src0 + int(round((cut - start) * ratio))
-    src_end = src0 + int(round((end - start) * ratio))
-    specs = [(start, src0, src_cut, cut - start), (cut, src_cut, src_end, end - cut)]
+    rate = float(speed) / 100.0
+    src_cut = src0 + int(round((cut - start) * rate * ratio))
+    # Source span = record length; SetSpeed then rescales the source (no-op at 100%).
+    specs = [(start, src0, src0 + int(round((cut - start) * ratio)), cut - start),
+             (cut, src_cut, src_cut + int(round((end - cut) * ratio)), end - cut)]
 
     def _place(track):
         pieces, attempts = [], []
@@ -6803,6 +6813,12 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
             attempts.append(attempt)
             if landed is None:
                 return pieces, attempts, False
+            if rate != 1.0:
+                try:
+                    attempt.append({"set_speed": bool(landed.SetSpeed({"Percentage": float(speed)})),
+                                    "start": _frame_int(landed.GetStart()), "end": _frame_int(landed.GetEnd())})
+                except Exception as exc:
+                    attempt.append({"set_speed": False, "error": f"SetSpeed failed: {exc}"})
             pieces.append(landed)
         return pieces, attempts, True
 
@@ -6843,6 +6859,21 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
                                          "temp_item_ids": [_safe_timeline_item_id(t) for t in temps]}})
     _carry(temps[0], finals[:1], "to_final_a")
     _carry(temps[1], finals[1:], "to_final_b")
+    if fusion_paths:
+        steps["fusion"] = []
+        for piece in finals:
+            imported = []
+            for path in fusion_paths:
+                try:
+                    imported.append(bool(piece.ImportFusionComp(path)))
+                except Exception as exc:
+                    imported.append(f"ImportFusionComp failed: {exc}")
+            try:
+                count = int(piece.GetFusionCompCount() or 0)
+            except Exception:
+                count = None
+            steps["fusion"].append({"timeline_item_id": _safe_timeline_item_id(piece),
+                                    "imported": imported, "comp_count": count})
     steps["temp_removed"] = bool(_timeline_delete_clips_verified(tl, temps, False, resolve=resolve))
     steps["temp_track_removed"] = bool(tl.DeleteTrack(track_type, temp_index))
     return finals, steps, None
@@ -6858,9 +6889,10 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
 
     Params: timeline_item_id; the cut as ``frame`` (absolute record frame, as
     GetStart reports) or ``offset`` (frames from the item start); include_linked
-    (default true: cut linked audio too); unlock_track; dry_run; confirm_token.
-    Blocked: a cut outside the item, Fusion comps (not carried), retime (source
-    math would be wrong), locked tracks without unlock_track.
+    (default true: cut linked audio too); unlock_track; work_dir (where Fusion comps
+    are exported for the carry; must be Resolve-writable); dry_run; confirm_token.
+    Constant speed and Fusion comps are carried. Blocked: a cut outside the item,
+    reversed or frozen items (speed <= 0), locked tracks without unlock_track.
     """
     item_id = p.get("timeline_item_id") or p.get("timelineItemId") or p.get("clip_id")
     if not item_id:
@@ -6905,20 +6937,29 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     targets = [item] + linked
 
     blockers = []
+    speeds: Dict[int, float] = {}
+    comp_counts: Dict[int, int] = {}
     for target in targets:
         try:
             comps = int(target.GetFusionCompCount() or 0) if _has_method(target, "GetFusionCompCount") else 0
         except Exception:
             comps = 0
-        if comps:
-            blockers.append(f"{_safe_timeline_item_id(target)} carries {comps} Fusion comp(s), which the rebuild does not carry")
+        comp_counts[id(target)] = comps
         try:
             speed = target.GetSpeed() if _has_method(target, "GetSpeed") else None
         except Exception:
             speed = None
-        if isinstance(speed, dict) and speed.get("Percentage") not in (None, 100, 100.0):
-            blockers.append(f"{_safe_timeline_item_id(target)} is retimed ({speed.get('Percentage')}%), "
+        percent = speed.get("Percentage") if isinstance(speed, dict) else None
+        try:
+            percent = 100.0 if percent is None else float(percent)
+        except (TypeError, ValueError):
+            percent = None
+        if percent is None or percent <= 0:
+            blockers.append(f"{_safe_timeline_item_id(target)} is reversed or frozen "
+                            f"({speed.get('Percentage') if isinstance(speed, dict) else speed}%), "
                             "so the source frames of the pieces cannot be derived")
+        else:
+            speeds[id(target)] = percent
     tracks = _items_tracks(targets)
     locked = _timeline_locked_tracks(tl, tracks)
     unlock = _coerce_bool(p.get("unlock_track"))
@@ -6930,8 +6971,11 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         "pieces": {"a": {"start": start, "end": cut}, "b": {"start": cut, "end": end}},
         "linked_audio": [_safe_timeline_item_id(i) for i in linked],
         "left_unlinked": [_safe_timeline_item_id(i) for i in all_linked if i not in linked],
-        "carried": ["grades"] + list(_SLIP_COPY_GROUPS),
-        "not_carried": ["retime", "Inspector keyframes", "Fusion comps", "transitions", "audio levels"],
+        "carried": ["grades"] + list(_SLIP_COPY_GROUPS) + ["constant speed", "Fusion comps"],
+        "speed_percent": {_safe_timeline_item_id(t): speeds.get(id(t)) for t in targets},
+        "fusion_comps": {_safe_timeline_item_id(t): comp_counts[id(t)] for t in targets
+                         if comp_counts.get(id(t))},
+        "not_carried": ["speed ramps", "Inspector keyframes", "transitions", "audio levels"],
         "track_locked": locked,
         "blockers": blockers,
     }
@@ -6951,7 +6995,8 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
             action="timeline.split_item", params=p,
             preview={"operation": "timeline.split_item",
                      "warning": "Deletes the item (and linked audio) and re-appends it as two pieces; "
-                                "grade and sizing are carried, retime, keyframes and Fusion are not.",
+                                "grade, sizing, constant speed and Fusion comps are carried, speed "
+                                "ramps and keyframes are not.",
                      **plan})
     blocked = _consume_confirm_token(action="timeline.split_item", params=p)
     if blocked:
@@ -6962,9 +7007,34 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         return _err("Failed to get MediaPool")
     tl_fps, _fps_err = _timeline_fps(tl)
     report: Dict[str, Any] = {"plan": plan, "steps": {}}
+    # Fusion comps are exported before anything changes, so a failed export
+    # leaves the item untouched; they are imported into both final pieces.
+    fusion_paths: Dict[int, List[str]] = {}
+    if any(comp_counts.values()):
+        work_dir = p.get("work_dir") or _resolve_safe_dir(tempfile.gettempdir())
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+        except OSError as exc:
+            return _err(f"Cannot create work_dir {work_dir!r} for the Fusion comps: {exc}",
+                        code="SPLIT_FUSION_EXPORT_FAILED", category="io_error")
+        stamp = int(time.time() * 1000)
+        for target in targets:
+            for index in range(1, comp_counts.get(id(target), 0) + 1):
+                path = os.path.join(work_dir, f"split_{_safe_timeline_item_id(target)}_{stamp}_{index}.comp")
+                try:
+                    exported = bool(target.ExportFusionComp(path, index))
+                except Exception as exc:
+                    exported, path = False, f"{path} ({exc})"
+                if not exported:
+                    return _err(f"ExportFusionComp failed for comp {index} ({path}); nothing was changed. "
+                                "Pass work_dir under a folder Resolve can write.",
+                                code="SPLIT_FUSION_EXPORT_FAILED", category="api_error")
+                fusion_paths.setdefault(id(target), []).append(path)
+        report["fusion_exports"] = [x for v in fusion_paths.values() for x in v]
     unlocked = []
     page_guard = _edit_page_for_timeline_edits(resolve) if resolve is not None else contextlib.nullcontext()
     pieces: Dict[str, List[Any]] = {}
+    fusion_want: Dict[str, int] = {}
     try:
         with page_guard:
             for name in locked:
@@ -6983,8 +7053,11 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
                 media_fps = _media_item_source_fps(_timeline_item_media_pool_item(target))
                 ratio = (media_fps / tl_fps) if (tl_fps and media_fps) else 1.0
                 key = f"{t_info[0]}:{t_info[1]}"
+                if comp_counts.get(id(target)):
+                    fusion_want[key] = comp_counts[id(target)]
                 done, report["steps"][key], err = _split_rebuild_one(
-                    mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve)
+                    mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve,
+                    speed=speeds.get(id(target), 100.0), fusion_paths=fusion_paths.get(id(target)))
                 if err:
                     if pieces:
                         err.setdefault("error", {}).setdefault("state", {})["already_split"] = {
@@ -7006,6 +7079,9 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     expected = [(start, cut), (cut, end)]
     verified = all(
         [(_frame_int(x.GetStart()), _frame_int(x.GetEnd())) for x in v] == expected for v in pieces.values())
+    for key, want in fusion_want.items():
+        rows = report["steps"].get(key, {}).get("fusion", [])
+        verified = verified and len(rows) == 2 and all(r.get("comp_count") == want for r in rows)
     main = pieces[f"{track_info[0]}:{track_info[1]}"]
 
     def _summary(piece):
@@ -7202,7 +7278,7 @@ def _timeline_edit_kernel_capabilities():
         },
         "unsupported": {
             "transition_cloning": "Resolve's public scripting API does not expose timeline item transition cloning.",
-            "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; split_item emulates it by rebuilding the item as two pieces (grade and sizing carried; retime, keyframes and Fusion comps are not).",
+            "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; split_item emulates it by rebuilding the item as two pieces (grade, sizing, constant speed and Fusion comps carried; speed ramps and keyframes are not).",
             "source_less_items": "Titles, generators, Fusion compositions, and subtitles without a MediaPoolItem cannot be cloned through AppendToTimeline clipInfo.",
             "deep_speed_ramp_semantics": "Only exposed Speed/RetimeProcess/MotionEstimation properties and supported keyframes are copied; opaque retime curves are not independently inspectable.",
         },
@@ -28021,7 +28097,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         (AppendToTimeline can return null-id items, e.g. into an occupied span).
         NEVER use move_clips to open a gap for an insert — that is what ripple_insert is for.
       replace_source_range(timeline_item_id, source_start|slip_frames, source_end?, unlock_track?, ignore_linked?, dry_run?, confirm_token?) -> {success, verified, timing, steps}
-      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
+      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, work_dir?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
         Slip a video item to a new source range at the same record frame, keeping grade,
         transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
         temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->

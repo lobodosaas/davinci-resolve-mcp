@@ -83,6 +83,24 @@ class _Item:
     def GetSpeed(self):
         return {"Percentage": self.speed, "PitchCorrection": True}
 
+    def SetSpeed(self, speed):
+        self.speed = float(speed["Percentage"])  # record duration kept, like Resolve
+        return True
+
+    def ExportFusionComp(self, path, index):
+        if index > self.fusion:
+            return False
+        with open(path, "w") as fh:
+            fh.write(f"comp {index} of {self.uid}")
+        self.tl.exported.append(path)
+        return True
+
+    def ImportFusionComp(self, path):
+        with open(path) as fh:
+            self.imported = getattr(self, "imported", []) + [fh.read()]
+        self.fusion += 1
+        return object()
+
     def GetProperty(self, key=None):
         return self.props.get(key)
 
@@ -124,6 +142,7 @@ class _Timeline:
         self.lock_calls = []
         self.links = {}
         self.link_calls = []
+        self.exported = []
 
     def all_items(self):
         return [i for kind in self.tracks.values() for items in kind.values() for i in items]
@@ -268,15 +287,44 @@ class SplitItemTest(unittest.TestCase):
             self.assertEqual(out["error"]["code"], "CUT_OUTSIDE_ITEM", frame)
         self.assertEqual(mp.appends, [])
 
-    def test_fusion_and_retime_block(self):
+    def test_reverse_or_freeze_speed_blocks(self):
         proj, tl, mp, video, _ = self._fixture()
-        video.fusion = 1
-        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
-        self.assertEqual(out["error"]["code"], "SPLIT_BLOCKED")
-        video.fusion, video.speed = 0, 50.0
-        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
-        self.assertEqual(out["error"]["code"], "SPLIT_BLOCKED")
+        for speed in (-100.0, 0.0):
+            video.speed = speed
+            out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
+            self.assertEqual(out["error"]["code"], "SPLIT_BLOCKED", speed)
         self.assertEqual(mp.appends, [])
+
+    def test_constant_speed_is_carried_with_scaled_source(self):
+        # Probe on 21.1.1: a 48-frame item at 50% from source 0, cut at +24 ->
+        # pieces 86400-86424 (src 0-12) and 86424-86448 (src 12-24).
+        proj, tl, mp, video, audio = self._fixture()
+        for item in (video, audio):
+            item.duration, item.src_start, item.speed = 48, 0, 50.0
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "offset": 24})
+        self.assertTrue(out["success"], out)
+        self.assertTrue(out["verified"], out)
+        for kind in ("video", "audio"):
+            pieces = sorted(tl.tracks[kind][1], key=lambda i: i.start)
+            self.assertEqual([(i.start, i.GetEnd(), i.src_start, i.speed) for i in pieces],
+                             [(86400, 86424, 0, 50.0), (86424, 86448, 12, 50.0)], kind)
+        # each append spans the piece's record length; Resolve rescales on SetSpeed
+        finals = [a for a in mp.appends if a["trackIndex"] == 1 and int(a.get("mediaType", 1)) == 1]
+        self.assertEqual([(a["startFrame"], a["endFrame"]) for a in finals], [(0, 24), (12, 36)])
+
+    def test_fusion_comps_are_carried_to_both_pieces(self):
+        import tempfile
+        proj, tl, mp, video, _ = self._fixture()
+        video.fusion = 2
+        with tempfile.TemporaryDirectory() as work:
+            out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440, "work_dir": work})
+            self.assertTrue(out["success"], out)
+            self.assertTrue(out["verified"], out)
+            self.assertTrue(all(p.startswith(work) for p in tl.exported), tl.exported)
+        v = sorted(tl.tracks["video"][1], key=lambda i: i.start)
+        self.assertEqual([i.fusion for i in v], [2, 2])
+        self.assertEqual(v[0].imported, [f"comp 1 of {video.uid}", f"comp 2 of {video.uid}"])
+        self.assertIn("fusion", out["steps"]["video:1"])
 
     def test_locked_track_needs_unlock_track(self):
         proj, tl, mp, video, _ = self._fixture(locked=True)

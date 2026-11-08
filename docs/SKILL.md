@@ -2594,8 +2594,9 @@ the timeline first, and refuses a locked track unless `unlock_track=true`.
 `timeline(action="split_item", params={"timeline_item_id": ..., "frame": N})`
 (or `"offset"` frames from the item start) rebuilds the item as two pieces the
 same way, cutting linked audio too unless `include_linked=false`, and relinks
-piece A with A and B with B. Grade and sizing are carried; retimed items and
-items with Fusion comps are refused. Confirm-token gated, `dry_run=true`
+piece A with A and B with B. Grade, sizing, constant speed and Fusion comps
+are carried (comps are exported to `work_dir`, which must be Resolve-writable);
+reversed or frozen items are refused, and speed ramps are not carried. Confirm-token gated, `dry_run=true`
 returns the plan. Trim = split, then `lift_range` the unwanted piece.
 
 **Resolve API object lifetimes** — Objects like timelines, clips, and color groups
