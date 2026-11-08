@@ -46,7 +46,7 @@ class _Item:
         self.start, self.duration, self.src_start = start, duration, src_start
         self.mpi = mpi
         self.props = {"ZoomX": 1.0, "ZoomY": 1.0, "Pan": 0.0, "Tilt": 0.0, "CropLeft": 0.0,
-                      "Opacity": 100.0}
+                      "Opacity": 100.0, "AnchorPointX": 0.0}
         self.grade_from = None
         self.fusion = 0
         self.speed = 100.0
@@ -105,7 +105,13 @@ class _Item:
     def GetProperty(self, key=None):
         return self.props.get(key)
 
+    #: keys SetProperty refuses (returns False, value unchanged), like
+    #: AnchorPointX on Studio 21.1.1.
+    refuse = frozenset()
+
     def SetProperty(self, key, value):
+        if key in self.refuse:
+            return False
         self.props[key] = value
         return True
 
@@ -369,6 +375,43 @@ class SplitItemTest(unittest.TestCase):
         self.assertIn(("timeline", "split_item"), s._TOKEN_GATED_DESTRUCTIVE_ACTIONS)
         self.assertTrue(classify_operation_risk("timeline", "split_item", {}).to_dict()["recognised"])
         self.assertIn("split_item", s._timeline_edit_kernel_capabilities()["supported"]["clip_operations"])
+
+
+class SplitPropertyHonestyTest(SplitItemTest):
+    def setUp(self):
+        _Item.refuse = frozenset({"AnchorPointX"})
+
+    def tearDown(self):
+        _Item.refuse = frozenset()
+
+    def test_refused_write_of_a_default_value_is_not_a_warning(self):
+        proj, tl, mp, video, _ = self._fixture()
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
+        self.assertTrue(out["success"], out)
+        self.assertTrue(out["verified"], out)
+        self.assertTrue(out["properties_fully_carried"], out)
+        self.assertNotIn("property_warnings", out)
+
+    def test_real_mismatch_is_reported_per_piece(self):
+        proj, tl, mp, video, _ = self._fixture()
+        video.props["AnchorPointX"] = 12.0
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440})
+        self.assertTrue(out["success"], out)
+        self.assertTrue(out["verified"], out)  # cut geometry is right
+        self.assertFalse(out["properties_fully_carried"], out)
+        warnings = out["property_warnings"]
+        self.assertEqual(sorted(w["piece"] for w in warnings), ["a", "b"])
+        for w in warnings:
+            self.assertEqual(w["track"], "video:1")
+            self.assertEqual(w["key"], "AnchorPointX")
+            self.assertEqual(w["expected"], 12.0)
+            self.assertEqual(w["got"], 0.0)
+
+    def test_preview_no_longer_says_audio_levels_are_dropped(self):
+        proj, tl, mp, video, _ = self._fixture()
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440, "dry_run": True})
+        self.assertNotIn("audio levels", out["plan"]["not_carried"])
+        self.assertIn("audio level and pan", out["plan"]["carried"])
 
 
 class SplitCarriesAudioLevelTest(SplitItemTest):

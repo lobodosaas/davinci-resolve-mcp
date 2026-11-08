@@ -6887,6 +6887,47 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
     return finals, steps, None
 
 
+#: Property groups split_item copies per track type and checks on the pieces.
+_SPLIT_VERIFY_GROUPS = {
+    "video": ("transform", "crop", "composite", "scaling", "dynamic_zoom", "stabilization"),
+    "audio": ("audio",),
+}
+
+
+def _split_property_snapshot(item, track_type: str) -> Dict[str, Any]:
+    snapshot = {}
+    for group in _SPLIT_VERIFY_GROUPS.get(track_type, ()):
+        for key in _DUPLICATE_COPY_PROPERTY_KEYS[group]:
+            try:
+                snapshot[key] = item.GetProperty(key)
+            except Exception:
+                snapshot[key] = None
+    return snapshot
+
+
+def _split_property_warnings(pieces: Dict[str, List[Any]], originals: Dict[str, Dict[str, Any]],
+                             steps: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Keys whose value on a final piece differs from the original's.
+
+    Compared on readback, not on the SetProperty return: Resolve refuses some
+    writes (AnchorPointX/Y, dynamic zoom and stabilization keys measured on
+    Studio 21.1.1) while the piece already holds the original's value — the
+    default — so a refused write alone is not a loss. A failed grade copy is
+    reported too.
+    """
+    warnings: List[Dict[str, Any]] = []
+    for track, items in pieces.items():
+        for label, piece in zip(("a", "b"), items):
+            for key, diff in _slip_property_mismatches(originals.get(track, {}), piece).items():
+                warnings.append({"track": track, "piece": label, "key": key, **diff})
+            for row in (steps.get(track, {}).get(f"to_final_{label}") or []):
+                grades = row.get("grades") if isinstance(row, dict) else None
+                if isinstance(grades, dict) and not grades.get("success"):
+                    warnings.append({"track": track, "piece": label, "key": "grades",
+                                     "error": "CopyGrades did not take"})
+    return warnings
+
+
 def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
     """Razor: cut a timeline item (and its linked audio) in two at a record frame.
 
@@ -6979,11 +7020,12 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         "pieces": {"a": {"start": start, "end": cut}, "b": {"start": cut, "end": end}},
         "linked_audio": [_safe_timeline_item_id(i) for i in linked],
         "left_unlinked": [_safe_timeline_item_id(i) for i in all_linked if i not in linked],
-        "carried": ["grades"] + list(_SLIP_COPY_GROUPS) + ["constant speed", "Fusion comps"],
+        "carried": ["grades"] + list(_SLIP_COPY_GROUPS) + ["constant speed", "Fusion comps",
+                                                            "audio level and pan"],
         "speed_percent": {_safe_timeline_item_id(t): speeds.get(id(t)) for t in targets},
         "fusion_comps": {_safe_timeline_item_id(t): comp_counts[id(t)] for t in targets
                          if comp_counts.get(id(t))},
-        "not_carried": ["speed ramps", "Inspector keyframes", "transitions", "audio levels"],
+        "not_carried": ["speed ramps", "Inspector keyframes", "transitions"],
         "track_locked": locked,
         "blockers": blockers,
     }
@@ -7003,8 +7045,8 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
             action="timeline.split_item", params=p,
             preview={"operation": "timeline.split_item",
                      "warning": "Deletes the item (and linked audio) and re-appends it as two pieces; "
-                                "grade, sizing, constant speed and Fusion comps are carried, speed "
-                                "ramps and keyframes are not.",
+                                "grade, sizing, constant speed, Fusion comps and the linked audio "
+                                "level and pan are carried, speed ramps and keyframes are not.",
                      **plan})
     blocked = _consume_confirm_token(action="timeline.split_item", params=p)
     if blocked:
@@ -7043,6 +7085,9 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     page_guard = _edit_page_for_timeline_edits(resolve) if resolve is not None else contextlib.nullcontext()
     pieces: Dict[str, List[Any]] = {}
     fusion_want: Dict[str, int] = {}
+    # Property values of each original, read before it is deleted, so the final
+    # pieces can be compared against them (property_warnings).
+    originals: Dict[str, Dict[str, Any]] = {}
     try:
         with page_guard:
             for name in locked:
@@ -7063,6 +7108,7 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
                 key = f"{t_info[0]}:{t_info[1]}"
                 if comp_counts.get(id(target)):
                     fusion_want[key] = comp_counts[id(target)]
+                originals[key] = _split_property_snapshot(target, t_info[0])
                 done, report["steps"][key], err = _split_rebuild_one(
                     mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve,
                     speed=speeds.get(id(target), 100.0), fusion_paths=fusion_paths.get(id(target)))
@@ -7090,6 +7136,7 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     for key, want in fusion_want.items():
         rows = report["steps"].get(key, {}).get("fusion", [])
         verified = verified and len(rows) == 2 and all(r.get("comp_count") == want for r in rows)
+    property_warnings = _split_property_warnings(pieces, originals, report["steps"])
     main = pieces[f"{track_info[0]}:{track_info[1]}"]
 
     def _summary(piece):
@@ -7099,6 +7146,8 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     return {
         "success": True,
         "verified": verified,
+        "properties_fully_carried": not property_warnings,
+        **({"property_warnings": property_warnings} if property_warnings else {}),
         "cut_frame": cut,
         "pieces": {"a": _summary(main[0]), "b": _summary(main[1])},
         "linked_pieces": {k: [_summary(x) for x in v] for k, v in pieces.items() if k != f"{track_info[0]}:{track_info[1]}"},
