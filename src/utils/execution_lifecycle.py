@@ -339,6 +339,8 @@ class RiskClassificationHook(LifecycleHook):
 
         ("timeline", "normalize_audio_level"),
         ("timeline_item", "add_transition"),
+        # copy_transition adds the same native transition at another cut.
+        ("timeline", "copy_transition"),
         ("timeline_item", "set_speed"),
         ("timeline_item", "set_fades"),
         # Pool reorganisation: clips and bins move, nothing is destroyed, but

@@ -176,7 +176,13 @@ Current partial areas:
 
 These are blocked by Resolve's public scripting API, not by MCP plumbing:
 
-- Transition cloning: no public timeline-item transition clone/read/write API.
+- Transition cloning: no clone verb, and a transition's type, category and
+  alignment are not readable. On 21.1+ `timeline(action="copy_transition")`
+  re-creates one: it reads the name and span, infers the alignment from the
+  span against its own cut (measured on 21.1.1: left ends at the cut, right
+  starts at it, centre straddles it, whichever side it was added from), and
+  calls `AddTransition` on the clip before (`before_item_id`) or after
+  (`after_item_id`) the target cut. Category defaults to `simple`.
 - Razor/split edits: no direct public timeline split primitive; `split_item`
   emulates it by rebuild (speed ramps and Inspector keyframes are not carried).
 - True partial lift: no direct partial-item delete; `split_item` then

@@ -7098,6 +7098,128 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     }
 
 
+def _is_transition_item(item) -> bool:
+    """A transition reports GetType()=='transition' on 21.1; older builds are told
+    apart by an empty GetProperty() (api_truth 'Transition create / copy / clone')."""
+    try:
+        if str(item.GetType()).lower() == "transition":
+            return True
+    except Exception:
+        pass
+    try:
+        return item.GetProperty() == {}
+    except Exception:
+        return False
+
+
+def _transition_alignment(start: int, end: int, cut: int) -> str:
+    """Measured on 21.1.1: left ends at the cut, right starts at it, centre straddles."""
+    if end == cut:
+        return "left"
+    if start == cut:
+        return "right"
+    return "center"
+
+
+def _track_clips_and_transitions(tl, track_type: str, track_index: int):
+    items = list(tl.GetItemListInTrack(track_type, track_index) or [])
+    trans = [i for i in items if _is_transition_item(i)]
+    clips = [i for i in items if i not in trans]
+    return clips, trans
+
+
+def _timeline_copy_transition_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a transition onto another cut (Resolve 21.1 AddTransition).
+
+    Resolve cannot clone a transition or read its type/alignment back: only the
+    name and frame range are readable. The copy takes the name (or ``type``),
+    the duration (end - start), the alignment inferred from the span against
+    its own cut, and ``category`` (default "simple"; unreadable on the source),
+    and adds it at the target cut named by ``before_item_id`` (the outgoing
+    clip: position "end") or ``after_item_id`` (the incoming clip: position
+    "start"). The new transition is read back and must match name, duration
+    and alignment.
+    """
+    src_id = p.get("transition_id") or p.get("source_transition_id")
+    if not src_id:
+        return _err("copy_transition requires transition_id", code="MISSING_TRANSITION_ID",
+                    category="invalid_input")
+    src = _find_timeline_item_by_id(tl, src_id)
+    if src is None:
+        return _err(f"No timeline item with id {src_id!r}", code="ITEM_NOT_FOUND", category="invalid_input")
+    if not _is_transition_item(src):
+        return _err(f"{src_id!r} is not a transition", code="NOT_A_TRANSITION", category="invalid_input")
+    src_info, info_err = _timeline_item_track_info(src)
+    if info_err:
+        return info_err
+    s_start, s_end = _frame_int(src.GetStart()), _frame_int(src.GetEnd())
+    clips, _ = _track_clips_and_transitions(tl, src_info[0], src_info[1])
+    src_cut = next((_frame_int(c.GetEnd()) for c in clips
+                    if s_start <= _frame_int(c.GetEnd()) <= s_end
+                    and any(_frame_int(o.GetStart()) == _frame_int(c.GetEnd()) for o in clips)), None)
+    if src_cut is None:
+        return _err("Could not find the cut under the source transition", code="SOURCE_CUT_NOT_FOUND",
+                    category="api_error")
+    name = p.get("type") or src.GetName()
+    if not name:
+        return _err("The source transition has no readable name (audio cross-fades read empty); pass type",
+                    code="TRANSITION_TYPE_UNKNOWN", category="invalid_input")
+    duration = s_end - s_start
+    alignment = _transition_alignment(s_start, s_end, src_cut)
+    category = p.get("category") or ("audio" if src_info[0] == "audio" else "simple")
+
+    before_id, after_id = p.get("before_item_id"), p.get("after_item_id")
+    if bool(before_id) == bool(after_id):
+        return _err("Pass exactly one of before_item_id (outgoing clip) or after_item_id (incoming clip)",
+                    code="MISSING_TARGET", category="invalid_input")
+    target = _find_timeline_item_by_id(tl, before_id or after_id)
+    if target is None:
+        return _err(f"No timeline item with id {before_id or after_id!r}", code="ITEM_NOT_FOUND",
+                    category="invalid_input")
+    t_info, info_err = _timeline_item_track_info(target)
+    if info_err:
+        return info_err
+    t_clips, t_trans = _track_clips_and_transitions(tl, t_info[0], t_info[1])
+    if before_id:
+        cut, position = _frame_int(target.GetEnd()), "end"
+        neighbour = any(_frame_int(c.GetStart()) == cut for c in t_clips if c is not target)
+    else:
+        cut, position = _frame_int(target.GetStart()), "start"
+        neighbour = any(_frame_int(c.GetEnd()) == cut for c in t_clips if c is not target)
+    if not neighbour:
+        return _err(f"No abutting clip at frame {cut} on {t_info[0]} track {t_info[1]}: not a cut",
+                    code="NO_CUT", category="invalid_input")
+    if any(_frame_int(t.GetStart()) <= cut <= _frame_int(t.GetEnd()) for t in t_trans):
+        return _err(f"The cut at {cut} already has a transition", code="TRANSITION_EXISTS",
+                    category="precondition")
+    options = {"type": name, "category": category, "position": position,
+               "alignment": alignment, "duration": duration}
+    error = validate_transition_options(options)
+    if error:
+        return _err(error, code="INVALID_TRANSITION_OPTIONS", category="invalid_input")
+    plan = {"source": {"transition_id": str(src_id), "name": src.GetName(), "start": s_start,
+                       "end": s_end, "cut": src_cut},
+            "target_cut": cut, "track": f"{t_info[0]}:{t_info[1]}", "options": options,
+            "category_note": "category is not readable from a transition; pass category to override"}
+    if _coerce_bool(p.get("dry_run")):
+        return {"success": True, "dry_run": True, "plan": plan}
+    missing = _requires_method(target, "AddTransition", "21.1")
+    if missing:
+        return missing
+    result = transition_result(target.AddTransition(dict(options)))
+    _, after = _track_clips_and_transitions(tl, t_info[0], t_info[1])
+    landed = next((t for t in after if _frame_int(t.GetStart()) <= cut <= _frame_int(t.GetEnd())), None)
+    if landed is None:
+        return _err("AddTransition placed nothing at the target cut (the clips may lack handles)",
+                    code="TRANSITION_NOT_ADDED", category="api_error", state={"plan": plan, "native": result})
+    got = {"timeline_item_id": _safe_timeline_item_id(landed), "name": landed.GetName(),
+           "start": _frame_int(landed.GetStart()), "end": _frame_int(landed.GetEnd())}
+    got["duration"] = got["end"] - got["start"]
+    got["alignment"] = _transition_alignment(got["start"], got["end"], cut)
+    verified = got["name"] == name and got["duration"] == duration and got["alignment"] == alignment
+    return {"success": True, "verified": verified, "transition": got, "plan": plan}
+
+
 def _timeline_copy_range_impl(proj, tl, p: Dict[str, Any], *, overwrite: bool = False, resolve=None):
     start, end, items, err = _collect_timeline_items_in_range(tl, p)
     if err:
@@ -7277,7 +7399,7 @@ def _timeline_edit_kernel_capabilities():
             "dynamic_zoom_scaling_stabilization": "Copied through exposed TimelineItem.GetProperty/SetProperty keys when a Resolve build returns writable values.",
         },
         "unsupported": {
-            "transition_cloning": "Resolve's public scripting API does not expose timeline item transition cloning.",
+            "transition_cloning": "Resolve has no transition clone verb and cannot read a transition's type, category or alignment. On 21.1+ copy_transition re-creates one at another cut from its name, duration and the alignment inferred from its span (category defaults to simple).",
             "razor_or_partial_lift": "Resolve's public scripting API does not expose a direct timeline split/razor primitive; split_item emulates it by rebuilding the item as two pieces (grade, sizing, constant speed and Fusion comps carried; speed ramps and keyframes are not).",
             "source_less_items": "Titles, generators, Fusion compositions, and subtitles without a MediaPoolItem cannot be cloned through AppendToTimeline clipInfo.",
             "deep_speed_ramp_semantics": "Only exposed Speed/RetimeProcess/MotionEstimation properties and supported keyframes are copied; opaque retime curves are not independently inspectable.",
@@ -28001,7 +28123,7 @@ _TIMELINE_ACTIONS = [
     "add_track", "delete_track", "get_track_sub_type", "set_track_enable",
     "get_track_enabled", "set_track_lock", "get_track_locked", "get_track_name",
     "set_track_name", "get_items", "delete_clips", "set_clips_linked", "duplicate",
-    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_range", "duplicate_range",
+    "duplicate_clips", "copy_clips", "move_clips", "ripple_insert", "replace_source_range", "split_item", "copy_transition", "copy_range", "duplicate_range",
     "overwrite_range", "lift_range", "story_spine_report", "create_variant_from_ranges",
     "bulk_set_item_properties", "apply_look_to_items", "thumbnail_contact_sheet",
     "marker_thumbnail_review", "edit_kernel_capabilities", "probe_edit_kernel_item",
@@ -28098,6 +28220,9 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         NEVER use move_clips to open a gap for an insert — that is what ripple_insert is for.
       replace_source_range(timeline_item_id, source_start|slip_frames, source_end?, unlock_track?, ignore_linked?, dry_run?, confirm_token?) -> {success, verified, timing, steps}
       split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, work_dir?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
+      copy_transition(transition_id, before_item_id|after_item_id, category?="simple", type?, dry_run?) -> {success, verified, transition{name,start,end,duration,alignment}, plan}
+        Resolve 21.1+. Copies name, duration and alignment (inferred from the span vs its cut)
+        onto the cut after before_item_id / before after_item_id; category is unreadable, default simple.
         Slip a video item to a new source range at the same record frame, keeping grade,
         transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
         temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->
@@ -28564,6 +28689,8 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         return _timeline_replace_source_range_impl(proj, tl, p, resolve=get_resolve())
     elif action == "split_item":
         return _timeline_split_item_impl(proj, tl, p, resolve=get_resolve())
+    elif action == "copy_transition":
+        return _timeline_copy_transition_impl(tl, p)
     elif action in {"copy_range", "duplicate_range"}:
         return _timeline_copy_range_impl(proj, tl, p)
     elif action == "overwrite_range":

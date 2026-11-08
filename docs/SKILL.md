@@ -2599,6 +2599,14 @@ are carried (comps are exported to `work_dir`, which must be Resolve-writable);
 reversed or frozen items are refused, and speed ramps are not carried. Confirm-token gated, `dry_run=true`
 returns the plan. Trim = split, then `lift_range` the unwanted piece.
 
+**Copying a transition** (Resolve 21.1+) — there is no clone verb, and only a
+transition's name and frame range are readable.
+`timeline(action="copy_transition", params={"transition_id": ..., "before_item_id": ...})`
+(or `"after_item_id"`) adds a transition with the same name and duration at the
+cut after/before that clip, with the alignment inferred from the source span
+against its cut. The category is unreadable and defaults to `simple` (pass
+`category` to override); the result is read back and `verified`.
+
 **Resolve API object lifetimes** — Objects like timelines, clips, and color groups
 returned by the API are live references that can become stale if the project state
 changes (e.g., the user deletes a timeline). Always re-fetch IDs after any
