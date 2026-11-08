@@ -52,6 +52,7 @@ from src.utils.resolve211_alignment import auto_align
 from src.utils.resolve211_dctl import native_dctl_result
 from src.utils.resolve211_normalization import normalize_audio
 from src.utils import audio_levels as _audio_levels
+from src.utils import color_wheels as _color_wheels
 from src.utils.subtitle_live import set_subtitle_preset as _set_live_subtitle_preset
 from src.utils.subtitle_live import list_captions_live as _list_live_captions
 from src.utils.subtitle_live import write_captions_live as _write_live_captions
@@ -30172,6 +30173,7 @@ _COLOR_GRADE_KERNEL_ACTIONS = [
     "safe_set_cdl",
     "safe_copy_grade",
     "safe_apply_drx",
+    "apply_wheels",
     "apply_trace_plan",
     "safe_export_lut",
     "grade_version_snapshot",
@@ -30766,6 +30768,100 @@ def _safe_export_lut(item, p: Dict[str, Any]):
         "size": os.path.getsize(path) if os.path.exists(path) else 0,
         "overwrote_existing": before_exists and os.path.exists(path),
     }
+
+
+def _apply_wheels(proj, item, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
+    """Primary wheels (lift / gamma / gain, master number or [r, g, b]; saturation 0-100).
+
+    The API cannot write wheel values (api_truth 'Color node graph editing and
+    primary grade values'). method="drx" (default): the offline DRX generator
+    writes a one-node grade with the wheels (Resolve panel units) and
+    Graph.ApplyGradeFromDRX applies it on the Color page (the previous page is
+    restored). If the generator is unavailable it falls back to method="cdl":
+    SetCDL with slope ~ gain, offset ~ lift, power ~ gamma (approximate).
+
+    Never silently wipes a grade: AddVersion first copies the current grade into
+    a new local version (version_name, default "MCP wheels N") and makes it
+    current, then the wheels replace that version's graph; the previous version
+    is reported and stays loadable (measured on Studio 21.1.1). Inspect frames
+    before grading (AGENTS.md: frame-referenced color work).
+    """
+    try:
+        params = _color_wheels.grade_params(p.get("lift"), p.get("gamma"), p.get("gain"), p.get("saturation"))
+    except _color_wheels.WheelError as exc:
+        return _err(str(exc), code="INVALID_WHEELS", category="invalid_input")
+    method = str(p.get("method") or "drx").lower()
+    if method not in ("drx", "cdl"):
+        return _err("method must be 'drx' or 'cdl'", code="INVALID_METHOD", category="invalid_input")
+    cdl = _color_wheels.cdl_approximation(params)
+    try:
+        previous = _ser(item.GetCurrentVersion())
+    except Exception:
+        previous = None
+    try:
+        existing = list(item.GetVersionNameList(0) or [])
+    except Exception:
+        existing = []
+    version_name = p.get("version_name")
+    if not version_name:
+        n = 1
+        while f"MCP wheels {n}" in existing:
+            n += 1
+        version_name = f"MCP wheels {n}"
+    if version_name in existing:
+        return _err(f"A local version named {version_name!r} already exists", code="VERSION_EXISTS",
+                    category="invalid_input")
+    plan = {"timeline_item_id": _safe_timeline_item_id(item), "method": method, "grade_params": params,
+            "cdl_approximation": cdl, "new_version": version_name, "previous_version": previous,
+            "note": "the wheels replace the graph of a NEW local version; the previous version is kept"}
+    if _dry_run_requested(p):
+        return {"success": True, "dry_run": True, "plan": plan}
+    if "confirm_token" not in p and "confirmToken" not in p and _confirm_token_required():
+        return _issue_confirm_token(action="apply_wheels", params=p, preview={
+            "operation": "timeline_item_color.apply_wheels",
+            "warning": "Adds a local grade version and replaces its graph with the wheels grade.", **plan})
+    blocked = _consume_confirm_token(action="apply_wheels", params=p)
+    if blocked:
+        return blocked
+
+    out: Dict[str, Any] = {"plan": plan, "previous_version": previous}
+    drx_path = None
+    if method == "drx":
+        work_dir = p.get("work_dir") or _resolve_safe_dir(tempfile.gettempdir())
+        drx_path = os.path.join(work_dir, f"mcp_wheels_{_safe_timeline_item_id(item)}_{int(time.time() * 1000)}.drx")
+        try:
+            os.makedirs(work_dir, exist_ok=True)
+            out["drx"] = _color_wheels.generate_drx(params, drx_path, label=version_name)
+        except Exception as exc:
+            method, out["fallback_reason"] = "cdl", f"DRX generation failed: {exc}"
+    if not item.AddVersion(version_name, 0):
+        return _err(f"AddVersion({version_name!r}) failed; nothing was applied", code="ADD_VERSION_FAILED",
+                    category="api_error", state=out)
+    out["version"] = _ser(item.GetCurrentVersion())
+    page = None
+    try:
+        page = resolve.GetCurrentPage() if resolve is not None else None
+        if resolve is not None and page != "color":
+            resolve.OpenPage("color")
+        if method == "drx":
+            graph = item.GetNodeGraph(1)
+            if not graph or not _has_method(graph, "ApplyGradeFromDRX"):
+                return _err("The item graph does not expose ApplyGradeFromDRX", code="APPLY_DRX_UNSUPPORTED",
+                            category="unsupported", state=out)
+            applied = _apply_drx_with_readback(graph, "item", drx_path, 0,
+                                               _drx_candidate_graphs("item", item=item))
+            if "error" in applied:
+                return applied
+            out.update({"applied": applied, "success": bool(applied.get("success"))})
+        else:
+            normalized = _normalize_cdl(cdl)
+            ok = bool(item.SetCDL(normalized))
+            out.update({"cdl": normalized, "success": ok})
+    finally:
+        if resolve is not None and page and page != "color":
+            resolve.OpenPage(page)
+    out["method_used"] = method
+    return out
 
 
 def _safe_apply_drx(proj, item, p: Dict[str, Any]):
@@ -32073,6 +32169,11 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
       safe_apply_drx(path, source?, grade_mode?, require_temp_path?) -> {success, path, source, changed_graphs, graphs, verification, warning?}
         REPLACES the target graph. Captures a version snapshot first; require_temp_path defaults True.
         # example: action_help(name='<action_name>')
+      apply_wheels(lift?, gamma?, gain?, saturation?, method?="drx", version_name?, work_dir?, dry_run?, confirm_token?) -> {success, method_used, version, previous_version, applied|cdl, fallback_reason?}
+        Primary wheels in Resolve panel units: lift/gamma a master number or [r,g,b] around 0
+        (~±0.05), gain around 1.0, saturation 0-100 (50 neutral). Generates a one-node .drx
+        offline and applies it on the Color page; falls back to SetCDL (approximate) without the
+        generator. Always on a NEW local version: the previous grade stays loadable.
       apply_trace_plan(plan_path|plan, dry_run?, min_confidence?=0.8, start_tolerance?=0, grade_mode?=0, version_name?, require_temp_path?=True, allow_timeline_mismatch?, max_rows?=40, verbose?, report_path?, confirm_token?) -> {success, applied, failed, skipped, attention, summary, report_path}
         The live half of the advanced server's color_trace (a ColorTrace that matches on media
         identity, cross-project, from the project DB). Resolves each plan entry to a clip on the
@@ -32152,6 +32253,8 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
         return _safe_copy_grade(item, p)
     elif action == "safe_apply_drx":
         return _safe_apply_drx(proj, item, p)
+    elif action == "apply_wheels":
+        return _apply_wheels(proj, item, p, resolve=get_resolve())
     elif action == "safe_export_lut":
         return _safe_export_lut(item, p)
     elif action == "grade_version_snapshot":

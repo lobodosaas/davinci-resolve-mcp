@@ -2036,6 +2036,14 @@ for most operations.
 
 Key actions:
 - `set_cdl(cdl)` — cdl: `{NodeIndex, Slope, Offset, Power, Saturation}`
+- `apply_wheels(lift?, gamma?, gain?, saturation?, method?, version_name?, work_dir?)`
+  — primary wheels in Resolve panel units (lift/gamma a master number or
+  `[r, g, b]` around 0, gain around 1.0, saturation 0-100 with 50 neutral). The
+  API cannot write wheels, so a one-node `.drx` is generated offline
+  (`scripts/generate_drx.mjs`, the `drx` generator) and applied on the Color
+  page; without node it falls back to an approximate `SetCDL`. It always adds a
+  new local version first (the previous grade stays loadable) and is
+  confirm-token gated. Inspect frames first (frame-referenced color work).
   - Slope/Offset/Power can be arrays `[R, G, B]` or strings like `"1.0 1.0 1.0"`
 - `add_version(name, type?)`, `load_version(name, type?)`, `get_version_names(type?)`
   - type: `0` = local, `1` = remote

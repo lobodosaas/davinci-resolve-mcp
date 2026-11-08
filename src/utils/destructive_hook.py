@@ -243,6 +243,7 @@ DESTRUCTIVE_ACTIONS_BY_TOOL: Dict[str, FrozenSet[str]] = {
     }),
     "timeline_item_color": frozenset({
         "set_cdl",
+        "apply_wheels",
         "copy_grades",
         "apply_trace_plan",
         "reset_all_node_colors",
@@ -383,6 +384,7 @@ NATIVE_DRY_RUN_ACTIONS: frozenset = frozenset({
     ("timeline", "split_item"),
     ("timeline", "copy_transition"),
     ("timeline_item_fusion", "animate_transform"),
+    ("timeline_item_color", "apply_wheels"),
     ("timeline_ai", "create_subtitles"),
     ("timeline_ai", "set_subtitle_preset"),
     ("timeline_ai", "write_captions_live"),

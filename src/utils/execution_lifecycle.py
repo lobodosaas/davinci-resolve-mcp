@@ -363,6 +363,8 @@ class RiskClassificationHook(LifecycleHook):
         ("timeline_item_color", "add_version"),
         ("timeline_item_color", "load_version"),
         ("timeline_item_color", "set_cdl"),
+        # apply_wheels: AddVersion, then the wheels replace the new version's graph.
+        ("timeline_item_color", "apply_wheels"),
         ("timeline_item_color", "assign_color_group"),
         ("timeline_item_color", "stabilize"),
         ("timeline_item_color", "smart_reframe"),

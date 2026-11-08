@@ -33,6 +33,7 @@ All actions are exposed through `timeline_item_color`.
 | `safe_set_cdl` | Validate and normalize CDL payloads before calling `SetCDL`; supports dry run. |
 | `safe_copy_grade` | Resolve target timeline item IDs before calling `CopyGrades`; supports dry run. |
 | `safe_apply_drx` | Validate DRX file existence and temp-path guard before calling `ApplyGradeFromDRX`. |
+| `apply_wheels` | Lift/gamma/gain/saturation: offline-generated one-node `.drx` applied on a new local version (Color page, previous page restored); approximate `SetCDL` fallback without node. |
 | `apply_trace_plan` | Apply the advanced server's `color_trace` plan to the current timeline: resolve each entry to a live clip by (name, record start, duration), dry-run resolution table, one confirm_token for the batch, timeline archived first, then `ApplyGradeFromDRX` per clip; `version_name` adds a local version per clip so the previous grade survives. Unresolved entries are reported, never guessed; the full per-clip tables go to `report_path`, the response carries the summary, an `attention` list and the first `max_rows` rows. |
 | `safe_export_lut` | Resolve LUT export type aliases and require temp output paths by default. |
 | `grade_version_snapshot` | Read current, local, and remote grade version names. |
