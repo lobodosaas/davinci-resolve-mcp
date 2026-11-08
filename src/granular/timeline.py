@@ -1041,6 +1041,7 @@ def create_timeline_from_clips(
         clip_ids: Simple form — list of MediaPoolItem unique IDs to append end-to-end.
         clip_infos: Positioned form — list of dicts with keys clip_id (or
             media_pool_item_id), start_frame, end_frame, record_frame.
+            end_frame is EXCLUSIVE (source frames; length = end_frame - start_frame).
             record_frame is relative to the created timeline start frame by
             default; pass record_frame_mode="absolute" for raw Resolve values.
         If both are None, uses the currently selected media pool clips.

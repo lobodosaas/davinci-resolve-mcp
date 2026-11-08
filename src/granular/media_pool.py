@@ -191,7 +191,8 @@ def append_to_timeline(
             nothing is appended.
         clip_infos: Positioned form — list of dicts with keys clip_id (or
             media_pool_item_id), start_frame, end_frame, record_frame, track_index,
-            and optional media_type (1=video only, 2=audio only). record_frame is
+            and optional media_type (1=video only, 2=audio only). end_frame is
+            EXCLUSIVE (source frames; length = end_frame - start_frame). record_frame is
             relative to the current timeline start frame by default; pass
             record_frame_mode="absolute" for raw Resolve recordFrame values.
             Returns timeline_item_id per appended item.
