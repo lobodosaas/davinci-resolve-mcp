@@ -2584,6 +2584,15 @@ temporary track, carrying grade, transform, crop, composite and scaling, and
 verifies start, end and duration exactly. It is confirm-token gated, archives
 the timeline first, and refuses a locked track unless `unlock_track=true`.
 
+**Cutting a clip (razor)** — there is no split API either, and an
+`AppendToTimeline` onto an occupied record range lands nothing.
+`timeline(action="split_item", params={"timeline_item_id": ..., "frame": N})`
+(or `"offset"` frames from the item start) rebuilds the item as two pieces the
+same way, cutting linked audio too unless `include_linked=false`, and relinks
+piece A with A and B with B. Grade and sizing are carried; retimed items and
+items with Fusion comps are refused. Confirm-token gated, `dry_run=true`
+returns the plan. Trim = split, then `lift_range` the unwanted piece.
+
 **Resolve API object lifetimes** — Objects like timelines, clips, and color groups
 returned by the API are live references that can become stale if the project state
 changes (e.g., the user deletes a timeline). Always re-fetch IDs after any
