@@ -12,7 +12,7 @@ that none exists).
 
 **Verified on:** DaVinci Resolve Studio 21.0.2
 
-**Totals:** 43 missing capabilities, 66 bugs / unreliable behaviors.
+**Totals:** 43 missing capabilities, 67 bugs / unreliable behaviors.
 
 The authoritative source is the runtime-queryable `api_truth` ledger
 (`resolve_control api_truth "<query>"`); this document is generated from
@@ -906,3 +906,11 @@ values, or automation-hostile modal prompts.
 - **Behavior:** With playback engaged, a visit to the Color page followed by a page/playhead restore (resolve_control restore_state) timed out, and from then on EVERY scripting call hung, including a brand-new scriptapp() connection: Resolve's main thread was stuck in a viewer render loop until playback was dealt with in the GUI. The 19.x scripting API has no transport control (no Play, Stop or IsPlaying), so a script can neither stop playback first nor ask whether it is running.
 - **Workaround / current handling:** Detect playback by reading Timeline.GetCurrentTimecode twice ~0.2 s apart; a playhead that moved means the transport is running. resolve_control open_page / restore_state, gallery_stills grab_and_export and the page-switching timeline_frame routes refuse with PLAYBACK_ACTIVE (allow_during_playback=true overrides). Stop playback in the GUI (Space or K) before retrying.
 - **Tags:** hang, page-dependent, playback, missing-method
+
+### Project.SetRenderSettings AudioCodec
+
+- **Object:** `Project`
+- **Signature:** `({'AudioCodec': str}) -> bool`
+- **Behavior:** GetAudioRenderCodecs('mp4') lists {'AAC': 'aac', 'FLAC': 'flac'}, but SetRenderSettings({'AudioCodec': 'aac'}) (or 'AAC') returns False on Linux and the queued job keeps the Deliver page codec ('lpcm' or 'flac' in GetRenderJobList()). An AAC encoder installed as a dvcp IO plugin is accepted only by its plugin id ('<vendor uuid>:<codec uuid>'), which no API call lists. There is no audio bitrate render setting at all.
+- **Workaround / current handling:** Pin the codec with render prepare_render_job audio_codec='aac': it tries the native name, then a listed or known AAC plugin id, and reads the job's AudioCodec back, failing on a mismatch.
+- **Tags:** silent-failure, render, audio

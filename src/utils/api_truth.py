@@ -4206,6 +4206,27 @@ API_TRUTH: List[Dict[str, Any]] = [
                     "DeleteKeyFrames(0.0) then -> [10, 20]; spline keyed before connect -> "
                     "[10, 20].",
     },
+    {
+        "symbol": "Project.SetRenderSettings AudioCodec",
+        "object": "Project",
+        "signature": "({'AudioCodec': str}) -> bool",
+        "reality": "GetAudioRenderCodecs('mp4') lists {'AAC': 'aac', 'FLAC': 'flac'}, "
+                   "but SetRenderSettings({'AudioCodec': 'aac'}) (or 'AAC') returns "
+                   "False on Linux and the queued job keeps the Deliver page codec "
+                   "('lpcm' or 'flac' in GetRenderJobList()). An AAC encoder installed "
+                   "as a dvcp IO plugin is accepted only by its plugin id "
+                   "('<vendor uuid>:<codec uuid>'), which no API call lists. There is "
+                   "no audio bitrate render setting at all.",
+        "recommended": "Pin the codec with render prepare_render_job audio_codec='aac': "
+                       "it tries the native name, then a listed or known AAC plugin id, "
+                       "and reads the job's AudioCodec back, failing on a mismatch.",
+        "tags": ["silent-failure", "render", "audio"],
+        "submit": "bug",
+        "verified_on": "DaVinci Resolve Studio 21.1.1.10 (Linux)",
+        "measured": "2026-11-08: format mp4/H264_NVIDIA; 'aac' -> False, job AudioCodec "
+                    "'lpcm'; dvcp-aac plugin id -> True, job AudioCodec = that id; "
+                    "'flac' -> True.",
+    },
 
 ]
 

@@ -53,6 +53,7 @@ from src.utils.resolve211_dctl import native_dctl_result
 from src.utils.resolve211_normalization import normalize_audio
 from src.utils import audio_levels as _audio_levels
 from src.utils import color_wheels as _color_wheels
+from src.utils import render_audio_codec as _render_audio_codec
 from src.utils.subtitle_live import set_subtitle_preset as _set_live_subtitle_preset
 from src.utils.subtitle_live import list_captions_live as _list_live_captions
 from src.utils.subtitle_live import write_captions_live as _write_live_captions
@@ -1396,6 +1397,8 @@ _TOKEN_GATED_DESTRUCTIVE_ACTIONS = frozenset({
     ("graph", "reset_all_grades"),
     # Batch grade carry-over from a color_trace plan: plan → confirm → apply.
     ("timeline_item_color", "apply_trace_plan"),
+    # Primary wheels into a new grade version: plan -> confirm -> apply.
+    ("timeline_item_color", "apply_wheels"),
     # 21.0 AI ops that render/generate NEW media files (additive, but expensive
     # and irreversible without manual cleanup) — gated so they never run by
     # surprise. They never modify source media.
@@ -6887,6 +6890,47 @@ def _split_rebuild_one(mp, tl, item, cut: int, *, track_type: str, ratio: float,
     return finals, steps, None
 
 
+#: Property groups split_item copies per track type and checks on the pieces.
+_SPLIT_VERIFY_GROUPS = {
+    "video": ("transform", "crop", "composite", "scaling", "dynamic_zoom", "stabilization"),
+    "audio": ("audio",),
+}
+
+
+def _split_property_snapshot(item, track_type: str) -> Dict[str, Any]:
+    snapshot = {}
+    for group in _SPLIT_VERIFY_GROUPS.get(track_type, ()):
+        for key in _DUPLICATE_COPY_PROPERTY_KEYS[group]:
+            try:
+                snapshot[key] = item.GetProperty(key)
+            except Exception:
+                snapshot[key] = None
+    return snapshot
+
+
+def _split_property_warnings(pieces: Dict[str, List[Any]], originals: Dict[str, Dict[str, Any]],
+                             steps: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Keys whose value on a final piece differs from the original's.
+
+    Compared on readback, not on the SetProperty return: Resolve refuses some
+    writes (AnchorPointX/Y, dynamic zoom and stabilization keys measured on
+    Studio 21.1.1) while the piece already holds the original's value — the
+    default — so a refused write alone is not a loss. A failed grade copy is
+    reported too.
+    """
+    warnings: List[Dict[str, Any]] = []
+    for track, items in pieces.items():
+        for label, piece in zip(("a", "b"), items):
+            for key, diff in _slip_property_mismatches(originals.get(track, {}), piece).items():
+                warnings.append({"track": track, "piece": label, "key": key, **diff})
+            for row in (steps.get(track, {}).get(f"to_final_{label}") or []):
+                grades = row.get("grades") if isinstance(row, dict) else None
+                if isinstance(grades, dict) and not grades.get("success"):
+                    warnings.append({"track": track, "piece": label, "key": "grades",
+                                     "error": "CopyGrades did not take"})
+    return warnings
+
+
 def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> Dict[str, Any]:
     """Razor: cut a timeline item (and its linked audio) in two at a record frame.
 
@@ -6979,11 +7023,12 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         "pieces": {"a": {"start": start, "end": cut}, "b": {"start": cut, "end": end}},
         "linked_audio": [_safe_timeline_item_id(i) for i in linked],
         "left_unlinked": [_safe_timeline_item_id(i) for i in all_linked if i not in linked],
-        "carried": ["grades"] + list(_SLIP_COPY_GROUPS) + ["constant speed", "Fusion comps"],
+        "carried": ["grades"] + list(_SLIP_COPY_GROUPS) + ["constant speed", "Fusion comps",
+                                                            "audio level and pan"],
         "speed_percent": {_safe_timeline_item_id(t): speeds.get(id(t)) for t in targets},
         "fusion_comps": {_safe_timeline_item_id(t): comp_counts[id(t)] for t in targets
                          if comp_counts.get(id(t))},
-        "not_carried": ["speed ramps", "Inspector keyframes", "transitions", "audio levels"],
+        "not_carried": ["speed ramps", "Inspector keyframes", "transitions"],
         "track_locked": locked,
         "blockers": blockers,
     }
@@ -7003,8 +7048,8 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
             action="timeline.split_item", params=p,
             preview={"operation": "timeline.split_item",
                      "warning": "Deletes the item (and linked audio) and re-appends it as two pieces; "
-                                "grade, sizing, constant speed and Fusion comps are carried, speed "
-                                "ramps and keyframes are not.",
+                                "grade, sizing, constant speed, Fusion comps and the linked audio "
+                                "level and pan are carried, speed ramps and keyframes are not.",
                      **plan})
     blocked = _consume_confirm_token(action="timeline.split_item", params=p)
     if blocked:
@@ -7043,6 +7088,9 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     page_guard = _edit_page_for_timeline_edits(resolve) if resolve is not None else contextlib.nullcontext()
     pieces: Dict[str, List[Any]] = {}
     fusion_want: Dict[str, int] = {}
+    # Property values of each original, read before it is deleted, so the final
+    # pieces can be compared against them (property_warnings).
+    originals: Dict[str, Dict[str, Any]] = {}
     try:
         with page_guard:
             for name in locked:
@@ -7063,6 +7111,7 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
                 key = f"{t_info[0]}:{t_info[1]}"
                 if comp_counts.get(id(target)):
                     fusion_want[key] = comp_counts[id(target)]
+                originals[key] = _split_property_snapshot(target, t_info[0])
                 done, report["steps"][key], err = _split_rebuild_one(
                     mp, tl, target, cut, track_type=t_info[0], ratio=ratio, resolve=resolve,
                     speed=speeds.get(id(target), 100.0), fusion_paths=fusion_paths.get(id(target)))
@@ -7090,6 +7139,7 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     for key, want in fusion_want.items():
         rows = report["steps"].get(key, {}).get("fusion", [])
         verified = verified and len(rows) == 2 and all(r.get("comp_count") == want for r in rows)
+    property_warnings = _split_property_warnings(pieces, originals, report["steps"])
     main = pieces[f"{track_info[0]}:{track_info[1]}"]
 
     def _summary(piece):
@@ -7099,6 +7149,8 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
     return {
         "success": True,
         "verified": verified,
+        "properties_fully_carried": not property_warnings,
+        **({"property_warnings": property_warnings} if property_warnings else {}),
         "cut_frame": cut,
         "pieces": {"a": _summary(main[0]), "b": _summary(main[1])},
         "linked_pieces": {k: [_summary(x) for x in v] for k, v in pieces.items() if k != f"{track_info[0]}:{track_info[1]}"},
@@ -23202,7 +23254,17 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
     if not os.path.isdir(target_dir):
         return _err(f"target_dir does not exist: {target_dir}")
     if _coerce_bool(p.get("require_temp_target"), True) and not _render_temp_path_ok(target_dir):
-        return _err("target_dir must be under the system temp directory unless require_temp_target=False")
+        return _err(
+            "target_dir must be under the system temp directory unless require_temp_target=False",
+            code="TARGET_DIR_NOT_TEMP",
+            category="invalid_input",
+            retryable=False,
+            remediation=(
+                "Pass a target_dir under the system temp directory, or pass "
+                "require_temp_target=false to render into this folder deliberately."
+            ),
+            state={"target_dir": target_dir},
+        )
     settings = dict(p.get("settings") or {})
     settings.setdefault("TargetDir", target_dir)
     if p.get("custom_name"):
@@ -23212,9 +23274,14 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         return err
     if not validation["valid"]:
         return {"success": False, "validation": validation}
+    audio_codec = p.get("audio_codec") or validation["settings"].get("AudioCodec")
     if _coerce_bool(p.get("dry_run")):
-        return _ok(validation=validation, format=p.get("format"), codec=p.get("codec"))
-    settings = validation["settings"]  # coerced bool keys, see _coerce_render_bool_settings
+        return _ok(validation=validation, format=p.get("format"), codec=p.get("codec"),
+                   audio_codec=audio_codec)
+    settings = dict(validation["settings"])  # coerced bool keys, see _coerce_render_bool_settings
+    # AudioCodec is applied on its own after the other settings, through the
+    # friendly-name resolution (a refused 'aac' must not sink the whole batch).
+    settings.pop("AudioCodec", None)
     before = _render_settings_snapshot(proj)
     # Pin the base render state before layering explicit settings on top. Without
     # this the job inherits the Deliver page's loaded preset for every key the
@@ -23227,6 +23294,7 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         if err:
             return err
     format_success = None
+    format_id = None
     if p.get("format") and p.get("codec"):
         formats = _render_formats(proj)
         format_id = _render_format_id_from_formats(formats, p["format"])
@@ -23256,7 +23324,43 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
                 },
             )
     settings_success = bool(proj.SetRenderSettings(settings))
+    audio = None
+    if settings_success and audio_codec:
+        if not format_id:
+            try:
+                format_id = (proj.GetCurrentRenderFormatAndCodec() or {}).get("format")
+            except Exception:
+                format_id = None
+        audio = _render_audio_codec.apply_audio_codec(proj, format_id, str(audio_codec))
+        if not audio["applied"]:
+            return _err(
+                f"Resolve refused audio codec {audio_codec!r} for format {format_id!r}; "
+                "no render job was queued.",
+                code="AUDIO_CODEC_REJECTED",
+                category="invalid_input",
+                remediation=(
+                    "Use a codec from render(action='get_audio_codecs') for this format, or pass "
+                    "the encoder's plugin id ('<vendor>:<codec>') as audio_codec."
+                ),
+                state=audio,
+            )
     job_id = proj.AddRenderJob() if settings_success else None
+    if job_id and audio:
+        audio["job_audio_codec"] = _render_audio_codec.job_audio_codec(proj, job_id)
+        if audio["job_audio_codec"] != audio["applied"]:
+            try:
+                audio["job_deleted"] = bool(proj.DeleteRenderJob(job_id))
+            except Exception:
+                audio["job_deleted"] = False
+            return _err(
+                f"The queued job reports AudioCodec {audio['job_audio_codec']!r}, not "
+                f"{audio['applied']!r} (requested {audio_codec!r}); the job was removed.",
+                code="AUDIO_CODEC_NOT_APPLIED",
+                category="resolve_api_failed",
+                retryable=False,
+                remediation="Set the audio codec on the Deliver page, or pass the encoder's plugin id.",
+                state={**audio, "job_id": job_id},
+            )
     result = {
         "success": bool(job_id),
         "job_id": job_id,
@@ -23265,6 +23369,8 @@ def _prepare_render_job(proj, p: Dict[str, Any]):
         "before": before,
         "settings": settings,
     }
+    if audio:
+        result["audio_codec"] = audio
     if preset_pin:
         result["preset_pinned"] = preset_pin
     elif settings.get("ExportVideo") is True:
@@ -23681,7 +23787,13 @@ def render(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
       probe_render_settings() -> {format_and_codec, mode, settings, jobs, is_rendering}
       validate_render_settings(settings, require_temp_target?) -> {valid, errors, unknown_keys}
       safe_set_render_settings(settings, dry_run?, restore?, require_temp_target?) -> {success, diff}
-      prepare_render_job(target_dir, settings?, format?, codec?, custom_name?, from_preset?, dry_run?) -> {success, job_id}
+      prepare_render_job(target_dir, settings?, format?, codec?, audio_codec?, custom_name?, from_preset?, require_temp_target?=true, dry_run?) -> {success, job_id, audio_codec?}
+        audio_codec pins the job's audio codec (friendly 'aac' / 'flac' / 'lpcm', or a plugin id
+        '<vendor>:<codec>'); without it the job inherits the Deliver page codec (often FLAC).
+        'aac' tries Resolve's native name, then an AAC encoder plugin id; the job's AudioCodec is
+        read back and a mismatch fails (AUDIO_CODEC_NOT_APPLIED, job removed). There is no audio
+        bitrate render setting in the API. require_temp_target=false allows a target_dir outside
+        the system temp dir (refused with TARGET_DIR_NOT_TEMP otherwise).
         from_preset pins the base render state (LoadRenderPreset) before the
         explicit settings go on top. Without it the job inherits the Deliver
         page's loaded preset for every key not passed, which the API gives no
@@ -24148,6 +24260,7 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
       create_timeline_from_clips(name, clip_infos, if_exists?) -> {success, name, id}
         — positioned: params.clip_infos is a list of {clip_id or media_pool_item_id,
           start_frame & end_frame (or startFrame/endFrame), record_frame/recordFrame}.
+          end_frame is EXCLUSIVE (SOURCE frames; length = end_frame - start_frame).
           record_frame is relative to the created timeline start frame by default;
           pass record_frame_mode="absolute" for raw Resolve recordFrame values.
       setup_multicam_timeline(name, clip_ids|angles, sync_mode?, include_audio?, dry_run?) -> {success}
@@ -24163,6 +24276,7 @@ def media_pool(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
         — positioned: params.clip_infos is a list of {clip_id or media_pool_item_id,
           start_frame & end_frame (or startFrame/endFrame), record_frame/recordFrame,
           track_index/trackIndex (1-based), optional media_type/mediaType (1=video, 2=audio)}.
+          end_frame is EXCLUSIVE (SOURCE frames; length = end_frame - start_frame).
           record_frame is relative to the current timeline start frame by default;
           pass record_frame_mode="absolute" for raw Resolve recordFrame values.
           Returns timeline_item_id per item.
@@ -28434,10 +28548,15 @@ _TIMELINE_ACTIONS = [
 def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Timeline operations: tracks, clips, import/export, generators, titles.
 
+    New on 21.1 (details: action_help(name=...)): split_item (razor, confirm_token),
+    copy_transition (copy a transition onto another cut), add_captions (Text+ captions
+    from segments or a transcription), set_caption_text (edit one caption).
+
     PREFER probe_* / *_capabilities / *_boundary_report / *_checked / dry_run variants
     where they exist. Raw mutators are kept for advanced callers but bypass guardrails.
-    DESTRUCTIVE actions auto-archive the current timeline (C6); pass strict=true for
-    refuse-on-archive-failure behavior on the catastrophic ops. To thread several
+    DESTRUCTIVE actions auto-archive the current timeline (C6); the confirm preview and
+    dry-run plan name the archive (`archive`), the response reports `archive.created`.
+    Pass strict=true for refuse-on-archive-failure behavior on the catastrophic ops. To thread several
     destructive calls into ONE archived predecessor instead of N, wrap them in
     timeline_versioning begin_run/end_run.
 
@@ -28507,7 +28626,15 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         (AppendToTimeline can return null-id items, e.g. into an occupied span).
         NEVER use move_clips to open a gap for an insert — that is what ripple_insert is for.
       replace_source_range(timeline_item_id, source_start|slip_frames, source_end?, unlock_track?, ignore_linked?, dry_run?, confirm_token?) -> {success, verified, timing, steps}
-      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, work_dir?, dry_run?, confirm_token?) -> {success, verified, cut_frame, pieces{a,b}, linked_pieces, steps}
+        Slip a video item to a new source range at the same record frame, keeping grade,
+        transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
+        temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->
+        re-apply properties -> drop temp. Start/end/duration verified exactly; a length a frame
+        off (mixed-fps) is corrected and retried. Locked track: TRACK_LOCKED unless
+        unlock_track=true (re-locked after). Confirm-token gated, timeline archived first.
+        Not carried: retime, Inspector keyframes, Fusion comps (refused), linked audio.
+      split_item(timeline_item_id, frame|offset, include_linked?=true, unlock_track?, work_dir?, dry_run?, confirm_token?) -> {success, verified, properties_fully_carried, property_warnings?, cut_frame, pieces{a,b}, linked_pieces, steps}
+        # example: action_help(name='split_item')
       copy_transition(transition_id, before_item_id|after_item_id, category?="simple", type?, dry_run?) -> {success, verified, transition{name,start,end,duration,alignment}, plan}
         Resolve 21.1+. Copies name, duration and alignment (inferred from the span vs its cut)
         onto the cut after before_item_id / before after_item_id; category is unreadable, default simple.
@@ -28516,13 +28643,7 @@ def timeline(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
         timeline start; clip_id chunks the clip's word transcription into max_words captions.
         Each caption is a Text+ in its own timeline in the "MCP Captions" bin, appended at its frame.
       set_caption_text(timeline_item_id, text, dry_run?) -> {success, previous_text, readback}
-        Slip a video item to a new source range at the same record frame, keeping grade,
-        transform, crop, composite and scaling. 19.x has no slip/trim API, so it rebuilds:
-        temp-track append -> CopyGrades -> delete original -> final append -> CopyGrades ->
-        re-apply properties -> drop temp. Start/end/duration verified exactly; a length a frame
-        off (mixed-fps) is corrected and retried. Locked track: TRACK_LOCKED unless
-        unlock_track=true (re-locked after). Confirm-token gated, timeline archived first.
-        Not carried: retime, Inspector keyframes, Fusion comps (refused), linked audio.
+        # example: action_help(name='add_captions')
       ripple_insert(clip_infos, record_frame|record_timecode, record_frame_mode?, dry_run?, confirm_token?) -> {success, plan | readback}
         Insert media-pool source ranges at a record point and shift ALL later video/audio
         items right by the inserted duration. DRY-RUN by default (returns the full plan);
@@ -29825,6 +29946,9 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
     """Properties, transforms, speed, keyframes, and metadata for a timeline item.
     Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
 
+    New on 21.1: set_audio writes clip level (AudioVolume, dB) and pan (AudioPan,
+    -100..100; a +-6 dB tilt, not a hard pan). Details: action_help(name='set_audio').
+
     Actions:
       flatten_multicam(grade_option?, ...) -> {success} — native 21.1, replaces multicam with its current angle.
       set_output_blanking(options, ...) -> {success} — native 21.1; disable timeline inheritance first.
@@ -29880,10 +30004,10 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
       get_audio(...) -> {AudioVolume, AudioPan, AudioSyncOffset, ..., linked_audio?}
       set_audio(AudioVolume?|volume_db?|Volume?, AudioPan?|Pan?, AudioSyncOffset?, ...) -> {success, targets[{timeline_item_id, results}], known_limitation?}
         Resolve 21.1+: AudioVolume in dB (clamped -100..+30), AudioPan -100 left..100 right, read back.
-        A video item writes its linked audio. Before 21.1 returns known_limitation.
-        — Resolve ignores Volume/Pan/EQ writes on audio; those return a
-          `known_limitation` block (bake gain into the media, or apply a
-          Fairlight preset). AudioSyncOffset / AudioSyncOffsetIsManual do work.
+        A video item writes its linked audio. Before 21.1 level/pan writes return a
+        `known_limitation` block (bake gain into the media, or apply a Fairlight
+        preset). EQ is not writable. AudioSyncOffset / AudioSyncOffsetIsManual work.
+        # example: action_help(name='set_audio')
       get_keyframes(property, ...) -> {property, count, keyframes}
       add_keyframe(property, frame, value, ...) -> {success}
       modify_keyframe(property, frame, new_value?, new_frame?, ...) -> {success}
@@ -29897,6 +30021,7 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
           changes. Exports the frame twice (null control), nudges property
           (default ZoomX), exports again, restores it. verdict: override,
           writes_render or inconclusive.
+      action_help(name?) -> {summary, params, returns, example}
 
     Default: track_type="video", track_index=1, item_index=0
     Or address the item by timeline_item_id (its GetUniqueId(), stable); on
@@ -29904,6 +30029,9 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
     timeline_id / timeline_name target a timeline other than the current one.
     """
     p = _params(params)
+    # action_help is pull-on-demand metadata; no Resolve connection needed.
+    if action == "action_help":
+        return _action_help("timeline_item", p)
     tl, item, err = _get_item(p)
     if err:
         return err
@@ -30184,7 +30312,7 @@ def timeline_item(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[
             return _err(f"Invalid interpolation. Must be one of: {', '.join(valid)}")
         return {"success": bool(item.SetKeyframeInterpolation(p["property"], p["frame"], p["interpolation"]))}
 
-    return _unknown(action, ["set_output_blanking","set_use_timeline_for_output_blanking","flatten_multicam","add_transition","set_speed","set_fades","get_speed","get_fades","get_type","get_output_blanking","get_use_timeline_for_output_blanking","get_name","get_property","set_property","get_duration","get_start","get_end","get_source_start_frame","get_source_end_frame","get_source_start_time","get_source_end_time","get_left_offset","get_right_offset","set_clip_enabled","get_clip_enabled","update_sidecar","get_unique_id","get_media_pool_item","get_stereo_convergence","get_stereo_left_window","get_stereo_right_window","get_linked_items","get_track_type_and_index","get_source_audio_mapping","load_burnin_preset","set_name","get_voice_isolation_state","set_voice_isolation_state","get_retime","set_retime","get_transform","set_transform","get_crop","set_crop","get_composite","set_composite","get_audio","set_audio","get_keyframes","add_keyframe","modify_keyframe","delete_keyframe","set_keyframe_interpolation","probe_keyframe_override"])
+    return _unknown(action, ["set_output_blanking","set_use_timeline_for_output_blanking","flatten_multicam","add_transition","set_speed","set_fades","get_speed","get_fades","get_type","get_output_blanking","get_use_timeline_for_output_blanking","get_name","get_property","set_property","get_duration","get_start","get_end","get_source_start_frame","get_source_end_frame","get_source_start_time","get_source_end_time","get_left_offset","get_right_offset","set_clip_enabled","get_clip_enabled","update_sidecar","get_unique_id","get_media_pool_item","get_stereo_convergence","get_stereo_left_window","get_stereo_right_window","get_linked_items","get_track_type_and_index","get_source_audio_mapping","load_burnin_preset","set_name","get_voice_isolation_state","set_voice_isolation_state","get_retime","set_retime","get_transform","set_transform","get_crop","set_crop","get_composite","set_composite","get_audio","set_audio","get_keyframes","add_keyframe","modify_keyframe","delete_keyframe","set_keyframe_interpolation","probe_keyframe_override","action_help"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -30278,6 +30406,9 @@ def timeline_item_markers(action: str, params: Optional[Dict[str, Any]] = None) 
 def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Fusion composition operations on timeline items. Identify by track_type, track_index, item_index (item_index is 0-BASED: 0 = first clip; track_index is 1-based).
 
+    New on 21.1: animate_transform (keyframed Size/Center/Angle; frames relative to the
+    item start). Details: action_help(name='animate_transform').
+
     Actions:
       add_comp(...) -> {success}
       get_comp_count(...) -> {count}
@@ -30294,6 +30425,7 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
       animate_transform(keyframes=[{frame, size?, center?:[x,y], angle?}], new_comp?, dry_run?) -> {success, verified, readback, comp_added}
         Keyframed transform via a Fusion Transform inserted before MediaOut1 (first comp, or a new one).
         frame is relative to the item start; Center normalised (0.5,0.5 = centre); Angle in degrees.
+      action_help(name?) -> {summary, params, returns, example}
 
     Default: track_type="video", track_index=1, item_index=0
     Or address the item by timeline_item_id (its GetUniqueId(), stable); on
@@ -30301,6 +30433,9 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
     timeline_id / timeline_name target a timeline other than the current one.
     """
     p = _params(params)
+    # action_help is pull-on-demand metadata; no Resolve connection needed.
+    if action == "action_help":
+        return _action_help("timeline_item_fusion", p)
     _, item, err = _get_item(p)
     if err:
         return err
@@ -30336,7 +30471,7 @@ def timeline_item_fusion(action: str, params: Optional[Dict[str, Any]] = None) -
         return {"success": bool(item.SetFusionOutputCache(p["value"]))}
     elif action == "animate_transform":
         return _timeline_item_animate_transform(item, p)
-    return _unknown(action, ["add_comp","get_comp_count","get_comp_names","get_comp_by_name","get_comp_by_index","export_comp","import_comp","delete_comp","load_comp","rename_comp","get_cache_enabled","set_cache","animate_transform"])
+    return _unknown(action, ["add_comp","get_comp_count","get_comp_names","get_comp_by_name","get_comp_by_index","export_comp","import_comp","delete_comp","load_comp","rename_comp","get_cache_enabled","set_cache","animate_transform","action_help"])
 
 
 def _dry_run_requested(p: Dict[str, Any]) -> bool:
@@ -31689,6 +31824,32 @@ _ACTION_HELP: Dict[str, Dict[str, Dict[str, Any]]] = {
                 '})'
             ),
         },
+        "apply_wheels": {
+            "summary": (
+                "Primary wheels (lift / gamma / gain, saturation). The API cannot write wheel "
+                "values, so method='drx' (default) generates a one-node DRX with the wheels and "
+                "applies it on the Color page; method='cdl' approximates with SetCDL. Never wipes "
+                "the current grade: AddVersion first creates a NEW local version (copy of the "
+                "current grade, made current) and the wheels replace that version's graph; the "
+                "previous version stays loadable."
+            ),
+            "params": (
+                "lift?, gamma?, gain? (master number or [r, g, b], Resolve panel units), "
+                "saturation? (0-100), method? ('drx'|'cdl'), version_name? (default 'MCP wheels N'), "
+                "work_dir?, dry_run?, confirm_token?, plus the item selector"
+            ),
+            "returns": "{success, method_used, version, previous_version, applied|cdl, fallback_reason?}; dry_run -> {plan}",
+            "caveats": (
+                "DESTRUCTIVE: the first live call returns {status: 'confirmation_required', "
+                "confirm_token}; re-call with it. Inspect frames before grading (AGENTS.md)."
+            ),
+            "example": (
+                'timeline_item_color(action="apply_wheels", params={\n'
+                '  "timeline_item_id": "TimelineItem-abc",\n'
+                '  "lift": [0, 0, 0.01], "gamma": 0.02, "gain": [1.02, 1.0, 0.98], "dry_run": True\n'
+                '})  # then without dry_run: confirm_token round-trip'
+            ),
+        },
     },
     "timeline": {
         "get_items": {
@@ -31801,6 +31962,168 @@ _ACTION_HELP: Dict[str, Dict[str, Dict[str, Any]]] = {
                 'timeline(action="delete_clips", params={\n'
                 '  "clip_ids": ["TimelineItem-abc"], "ripple": True\n'
                 '})  # first call returns confirm_token if ripple=True; re-call with it to delete'
+            ),
+        },
+        "split_item": {
+            "summary": (
+                "Razor (Resolve 21.1+): cut one timeline item, and its linked audio, in two at a "
+                "record frame. The API has no split, so each item is rebuilt as two pieces through "
+                "a temporary track. Carried: grade, transform/crop/composite/scaling/dynamic zoom/"
+                "stabilization, clip colour, flags, markers, constant speed (SetSpeed), Fusion comps "
+                "(exported then imported into both pieces) and the audio level and pan "
+                "(AudioVolume/AudioPan) of linked audio. Not carried: speed ramps, Inspector "
+                "keyframes, transitions. DESTRUCTIVE: confirm_token gated, timeline archived first."
+            ),
+            "params": (
+                "timeline_item_id, frame (ABSOLUTE record frame, as get_items reports start) | "
+                "offset (frames from the item start), include_linked? (default true), "
+                "unlock_track? (default false: a locked track is refused with TRACK_LOCKED), "
+                "work_dir? (Resolve-writable folder for the Fusion comp export), dry_run?, "
+                "confirm_token?"
+            ),
+            "returns": (
+                "{success, verified (cut geometry + Fusion comp counts), properties_fully_carried, "
+                "property_warnings?, cut_frame, pieces{a,b}, linked_pieces, steps}; dry_run -> {plan}"
+            ),
+            "caveats": (
+                "The cut must fall strictly inside the item. Reversed or frozen items (speed <= 0) "
+                "are refused (SPLIT_BLOCKED). Piece ids are new: re-read them from pieces. "
+                "property_warnings lists keys whose value differs on a piece after the copy."
+            ),
+            "example": (
+                'timeline(action="split_item", params={\n'
+                '  "timeline_item_id": "TimelineItem-abc", "offset": 48, "dry_run": True\n'
+                '})  # read plan, then call without dry_run: first call returns confirm_token,\n'
+                '   # re-call with it to cut'
+            ),
+        },
+        "copy_transition": {
+            "summary": (
+                "Copy a transition onto another cut (Resolve 21.1+ AddTransition). Resolve cannot "
+                "clone a transition or read its type or alignment: the copy takes the name (or "
+                "type), the duration, and the alignment INFERRED from the source span against its "
+                "own cut (ends at the cut = left, starts at it = right, else center). The new "
+                "transition is read back and verified on name, duration and alignment."
+            ),
+            "params": (
+                "transition_id (a transition item from get_items, kind=transition), exactly one of "
+                "before_item_id (the outgoing clip: cut at its end) | after_item_id (the incoming "
+                "clip: cut at its start), category? (default 'simple'; 'audio' on audio tracks; "
+                "not readable from the source), type? (required for audio cross-fades, whose name "
+                "reads empty), dry_run?"
+            ),
+            "returns": "{success, verified, transition{timeline_item_id, name, start, end, duration, alignment}, plan}",
+            "caveats": (
+                "The target cut needs media handles on both clips for the duration and alignment, "
+                "else TRANSITION_NOT_ADDED. A cut that already has a transition is refused "
+                "(TRANSITION_EXISTS). Not confirm-token gated; the timeline is archived first."
+            ),
+            "example": (
+                'timeline(action="copy_transition", params={\n'
+                '  "transition_id": "TimelineItem-xfade", "before_item_id": "TimelineItem-clipA",\n'
+                '  "dry_run": True\n'
+                '})'
+            ),
+        },
+        "add_captions": {
+            "summary": (
+                "Burned-in style captions as Text+ titles on a video track. Each caption is a Text+ "
+                "inside its own timeline in the Media Pool bin 'MCP Captions', appended at the "
+                "caption's record frame. The inner title is 5 s long, so a caption longer than 5 s "
+                "is split into consecutive pieces of the same inner timeline. Your current timeline "
+                "and Media Pool folder are restored."
+            ),
+            "params": (
+                "segments=[{start, end, text}] (SECONDS from the timeline start, non-overlapping) | "
+                "clip_id (a transcribed Media Pool clip) + record_offset? (SECONDS on the timeline "
+                "where the clip's first frame sits, default 0) + max_words? (words per caption, "
+                "default 3; a pause over 1 s also ends a caption), track_index? (existing video "
+                "track; default a new track above the highest), style?{font, size, color [r,g,b] "
+                "0-1, position (vertical 0-1)}, dry_run?"
+            ),
+            "returns": (
+                "{success, verified, track_index, captions[{text, items[{timeline_item_id, start, "
+                "end}], inner_timeline}]}"
+            ),
+            "caveats": (
+                "clip_id needs a transcription first (media_pool_item transcribe_audio), else "
+                "NO_TRANSCRIPTION. A track_index whose range is occupied is refused. Edit text "
+                "later with set_caption_text."
+            ),
+            "example": (
+                'timeline(action="add_captions", params={\n'
+                '  "segments": [{"start": 0.5, "end": 2.0, "text": "Hello"},\n'
+                '               {"start": 2.2, "end": 4.0, "text": "and welcome"}],\n'
+                '  "style": {"size": 0.08, "color": [1, 1, 1], "position": 0.12},\n'
+                '  "dry_run": True\n'
+                '})\n'
+                '# from a transcription: {"clip_id": "<pool id>", "record_offset": 0, "max_words": 3}'
+            ),
+        },
+        "set_caption_text": {
+            "summary": (
+                "Change the text of a caption placed by add_captions (its inner Text+ "
+                "StyledText). Every piece of a caption longer than 5 s shares one inner timeline, "
+                "so every piece changes."
+            ),
+            "params": "timeline_item_id (any piece of the caption), text, dry_run? (returns the current text)",
+            "returns": "{success, previous_text, readback}",
+            "example": (
+                'timeline(action="set_caption_text", params={\n'
+                '  "timeline_item_id": "TimelineItem-cap1", "text": "Hello there"\n'
+                '})'
+            ),
+        },
+    },
+    "timeline_item_fusion": {
+        "animate_transform": {
+            "summary": (
+                "Keyframed Size / Center / Angle through a Fusion Transform inserted before "
+                "MediaOut1 in the item's first comp (or a new comp). Values are read back per key."
+            ),
+            "params": (
+                "keyframes=[{frame, size?, center?: [x, y], angle?}], new_comp? (always add a "
+                "comp), dry_run?, plus the item selector (timeline_item_id | track_type, "
+                "track_index, item_index). frame is relative to the item start (0 = first frame "
+                "of the item, max duration-1), NOT a timeline frame. size 1.0 = original; center "
+                "normalised (0.5, 0.5 = frame centre); angle in degrees."
+            ),
+            "returns": "{success, verified, readback, comp_added}",
+            "caveats": (
+                "The animation lives in the Fusion comp, not in Inspector keyframes: "
+                "timeline_item get_keyframes does not see it."
+            ),
+            "example": (
+                'timeline_item_fusion(action="animate_transform", params={\n'
+                '  "timeline_item_id": "TimelineItem-abc",\n'
+                '  "keyframes": [{"frame": 0, "size": 1.0, "center": [0.5, 0.5]},\n'
+                '                {"frame": 47, "size": 1.2, "center": [0.55, 0.5], "angle": 3}]\n'
+                '})'
+            ),
+        },
+    },
+    "timeline_item": {
+        "set_audio": {
+            "summary": (
+                "Clip audio level and pan on Resolve 21.1+ (AudioVolume / AudioPan), read back. A "
+                "video item writes its linked audio items. Before 21.1 the level/pan writes return "
+                "known_limitation (bake gain or use a Fairlight preset). AudioSyncOffset works on "
+                "every build."
+            ),
+            "params": (
+                "AudioVolume | volume_db | Volume (dB, clamped -100..+30; 0 = unity), AudioPan | Pan "
+                "(-100 = left .. 100 = right), AudioSyncOffset?, plus the item selector."
+            ),
+            "returns": "{success, targets[{timeline_item_id, results}], known_limitation?}",
+            "caveats": (
+                "Pan follows Resolve's pan law: -100/100 is a +-6 dB tilt between the channels, "
+                "not a hard pan; the far channel stays audible. Use Fairlight routing for a true "
+                "hard pan."
+            ),
+            "example": (
+                'timeline_item(action="set_audio", params={\n'
+                '  "timeline_item_id": "TimelineItem-abc", "volume_db": -6, "AudioPan": -50\n'
+                '})'
             ),
         },
     },
@@ -32416,6 +32739,7 @@ def timeline_item_color(action: str, params: Optional[Dict[str, Any]] = None) ->
     - For batch matching, use bulk_match_to_hero (returns confirm_token; dry_run first).
     - To formalize a recommendation, use propose_grade — validated structured output.
     - PREFER safe_*/probe_*/*_capabilities/*_boundary_report variants over raw mutators.
+    - New on 21.1: apply_wheels (lift/gamma/gain into a NEW local version; confirm_token).
     </when_to_use>
 
     <returns>

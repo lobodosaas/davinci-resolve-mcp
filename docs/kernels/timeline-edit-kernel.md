@@ -81,6 +81,12 @@ source 0-12 and 12-24, rendering identical to the original). Fusion comps are
 exported (`ExportFusionComp`, into `work_dir`, which must be Resolve-writable)
 before anything changes and imported into both final pieces. Refused: a cut
 outside the item, reversed or frozen items, locked tracks without `unlock_track`.
+Linked audio pieces keep the clip level and pan (`AudioVolume`/`AudioPan`).
+`verified` reports the cut geometry (and Fusion comp counts); each piece's
+properties are read back against the original, and any key whose value differs
+is listed in `property_warnings` with `properties_fully_carried: false`. A
+write Resolve refuses (AnchorPointX/Y, dynamic zoom, stabilization on 21.1.1)
+is not a warning when the piece already holds the original's value.
 A trim is a split followed by `lift_range` on the unwanted piece.
 
 ### Linked audio

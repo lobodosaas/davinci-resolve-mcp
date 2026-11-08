@@ -570,6 +570,15 @@ class ReadbackVerificationHook(LifecycleHook):
                 "contradiction": contradiction,
             }
 
+        # A confirm-token issuance or a dry run mutated nothing: nothing to verify.
+        if result.get("status") == "confirmation_required" or result.get("dry_run") is True:
+            return None
+
+        # Handlers that read their own mutation back report a top-level verified.
+        if isinstance(result.get("verified"), bool):
+            return {"readback_checked": True, "verified": result["verified"],
+                    "contradiction": False}
+
         # Track unverified destructive operations
         if ctx.risk.destructive and "verification" not in result:
             return {
