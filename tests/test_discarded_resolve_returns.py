@@ -76,6 +76,16 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         "without the spline the assignment sets a STATIC value and no keyframe"
     ),
     ("server.py", "_fusion_add_mask", "SetInput"): NIL,
+    ("server.py", "_timeline_add_captions_impl", "SetInput"): (
+        NIL + "; StyledText is read back with GetInput and reported per caption "
+        "(text_readback) and in `verified`"
+    ),
+    ("server.py", "_timeline_set_caption_text_impl", "SetInput"): (
+        NIL + "; StyledText is read back with GetInput and `success` is the comparison"
+    ),
+    ("server.py", "_timeline_item_animate_transform", "SetInput"): (
+        NIL + "; every keyframe is read back with GetInput(name, frame) and compared"
+    ),
     ("server.py", "_fusion_add_mask", "SetAttrs"): NIL,
     ("server.py", "_safe_add_fusion_tool", "SetAttrs"): NIL,
     ("server.py", "_safe_set_fusion_inputs", "SetInput"): NIL + "; the action takes readback=True",

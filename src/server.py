@@ -7414,26 +7414,37 @@ def _timeline_add_captions_impl(proj, tl, p: Dict[str, Any], *, resolve=None) ->
     previous_folder = mp.GetCurrentFolder()
     stamp = time.strftime("%H%M%S")
     placed_all: List[Dict[str, Any]] = []
+    restore: Dict[str, Any] = {}
     verified = True
     try:
         for cap in captions:
-            mp.SetCurrentFolder(folder)
+            if not mp.SetCurrentFolder(folder):
+                return _err(f"Could not open the {_CAPTION_FOLDER!r} bin", code="FOLDER_FAILED",
+                            category="api_error", state={"placed": placed_all})
             inner = mp.CreateEmptyTimeline(f"MCP Caption {stamp} {cap['index'] + 1:03d}")
             if not inner:
                 return _err("CreateEmptyTimeline failed for a caption", code="CAPTION_TIMELINE_FAILED",
                             category="api_error", state={"placed": placed_all})
-            proj.SetCurrentTimeline(inner)
+            # InsertFusionTitleIntoTimeline writes into the CURRENT timeline, so a
+            # refused switch would put the title into the user's timeline instead.
+            if not proj.SetCurrentTimeline(inner):
+                return _err("Could not switch to the caption timeline", code="TIMELINE_SWITCH_FAILED",
+                            category="api_error", state={"placed": placed_all})
             title = inner.InsertFusionTitleIntoTimeline("Text+")
             text_tool = _caption_text_tool(inner) if title else None
             if text_tool is None:
-                proj.SetCurrentTimeline(tl)
                 return _err("Could not insert a Text+ title into the caption timeline",
                             code="CAPTION_TITLE_FAILED", category="api_error", state={"placed": placed_all})
             text_tool.SetInput("StyledText", cap["text"])
             for key, value in style_inputs.items():
                 text_tool.SetInput(key, value)
+            cap["text_readback"] = text_tool.GetInput("StyledText") == cap["text"]
+            verified = verified and cap["text_readback"]
             title_frames = _frame_int(title.GetDuration()) or 0
-            proj.SetCurrentTimeline(tl)
+            # AppendToTimeline appends to the CURRENT timeline: back to the user's first.
+            if not proj.SetCurrentTimeline(tl):
+                return _err("Could not switch back to the edited timeline", code="TIMELINE_SWITCH_FAILED",
+                            category="api_error", state={"placed": placed_all})
             inner_mpi = inner.GetMediaPoolItem()
             cap["items"] = []
             record = cap["record_start"]
@@ -7452,13 +7463,13 @@ def _timeline_add_captions_impl(proj, tl, p: Dict[str, Any], *, resolve=None) ->
             placed_all.append(cap)
     finally:
         try:
-            proj.SetCurrentTimeline(tl)
-        except Exception:
-            pass
+            restore["timeline"] = bool(proj.SetCurrentTimeline(tl))
+        except Exception as exc:
+            restore["timeline"] = f"SetCurrentTimeline failed: {exc}"
         if previous_folder:
-            mp.SetCurrentFolder(previous_folder)
+            restore["folder"] = bool(mp.SetCurrentFolder(previous_folder))
     return {"success": verified, "verified": verified, "track_index": track_index,
-            "captions": placed_all, "folder": _CAPTION_FOLDER}
+            "captions": placed_all, "folder": _CAPTION_FOLDER, "restored": restore}
 
 
 def _timeline_set_caption_text_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -31119,8 +31130,10 @@ def _apply_wheels(proj, item, p: Dict[str, Any], *, resolve=None) -> Dict[str, A
     page = None
     try:
         page = resolve.GetCurrentPage() if resolve is not None else None
-        if resolve is not None and page != "color":
-            resolve.OpenPage("color")
+        if resolve is not None and page != "color" and not resolve.OpenPage("color"):
+            return _err("Could not open the Color page for ApplyGradeFromDRX / SetCDL; the new version "
+                        f"{version_name!r} holds a copy of the previous grade", code="PAGE_SWITCH_FAILED",
+                        category="api_error", state=out)
         if method == "drx":
             graph = item.GetNodeGraph(1)
             if not graph or not _has_method(graph, "ApplyGradeFromDRX"):
@@ -31137,7 +31150,7 @@ def _apply_wheels(proj, item, p: Dict[str, Any], *, resolve=None) -> Dict[str, A
             out.update({"cdl": normalized, "success": ok})
     finally:
         if resolve is not None and page and page != "color":
-            resolve.OpenPage(page)
+            out["page_restored"] = bool(resolve.OpenPage(page))
     out["method_used"] = method
     return out
 

@@ -87,7 +87,7 @@ class _Item:
 
 
 def _fake_generate(params, path, label="MCP wheels"):
-    with open(path, "w") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write("<drx/>")
     _fake_generate.last = params
     return {"ok": True, "outputPath": path, "bytes": 6}

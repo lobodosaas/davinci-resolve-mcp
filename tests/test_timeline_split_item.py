@@ -90,13 +90,13 @@ class _Item:
     def ExportFusionComp(self, path, index):
         if index > self.fusion:
             return False
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(f"comp {index} of {self.uid}")
         self.tl.exported.append(path)
         return True
 
     def ImportFusionComp(self, path):
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             self.imported = getattr(self, "imported", []) + [fh.read()]
         self.fusion += 1
         return object()
