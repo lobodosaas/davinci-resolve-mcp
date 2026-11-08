@@ -6983,7 +6983,7 @@ def _timeline_split_item_impl(proj, tl, p: Dict[str, Any], *, resolve=None) -> D
         return _track_locked_refusal(locked, "split_item",
                                      extra_remediation="Or pass unlock_track=true: the tracks are unlocked "
                                                        "for the cut and locked again afterwards.")
-    if _coerce_bool(p.get("dry_run")):
+    if _dry_run_requested(p):
         return {"success": not blockers, "dry_run": True, "plan": plan}
     if blockers:
         return _err("; ".join(blockers), code="SPLIT_BLOCKED", category="precondition", state={"plan": plan})
@@ -7201,7 +7201,7 @@ def _timeline_copy_transition_impl(tl, p: Dict[str, Any]) -> Dict[str, Any]:
                        "end": s_end, "cut": src_cut},
             "target_cut": cut, "track": f"{t_info[0]}:{t_info[1]}", "options": options,
             "category_note": "category is not readable from a transition; pass category to override"}
-    if _coerce_bool(p.get("dry_run")):
+    if _dry_run_requested(p):
         return {"success": True, "dry_run": True, "plan": plan}
     missing = _requires_method(target, "AddTransition", "21.1")
     if missing:

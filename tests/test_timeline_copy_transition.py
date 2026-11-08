@@ -102,6 +102,13 @@ class CopyTransitionTest(unittest.TestCase):
             self.assertEqual(out["plan"]["target_cut"], 86496)
             self.assertEqual(tl.calls, [])
 
+    def test_dry_run_camel_case_alias_changes_nothing(self):
+        tl, _ = _fixture()
+        out = s._timeline_copy_transition_impl(tl, {"transition_id": "src", "before_item_id": "b",
+                                                    "dryRun": True})
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(tl.calls, [])
+
     def test_source_must_be_a_transition(self):
         tl, _ = _fixture()
         out = s._timeline_copy_transition_impl(tl, {"transition_id": "a", "before_item_id": "b"})

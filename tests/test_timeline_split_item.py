@@ -343,6 +343,15 @@ class SplitItemTest(unittest.TestCase):
         self.assertEqual(out["plan"]["linked_audio"], [audio.uid])
         self.assertEqual(mp.appends, [])
 
+    def test_dry_run_camel_case_alias_changes_nothing(self):
+        # The destructive hook treats dryRun as a dry run and skips the archive,
+        # so the handler must not mutate on it either.
+        proj, tl, mp, video, _ = self._fixture()
+        out = self._run(proj, tl, {"timeline_item_id": video.uid, "frame": 86440, "dryRun": True})
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["plan"]["cut_frame"], 86440)
+        self.assertEqual(mp.appends, [])
+
     def test_confirm_token_gated(self):
         proj, tl, mp, video, _ = self._fixture()
         with mock.patch.object(s, "_confirm_token_required", return_value=True), \
