@@ -1610,13 +1610,14 @@ def ti_clear_flags(color: str = "", item_index: int = 0, track_type: str = "vide
     """Clear flags from a timeline item.
 
     Args:
-        color: Color to clear, or '' for all.
+        color: Color to clear, or '' / "All" for all.
         item_index: 0-based item index. Default: 0.
     """
     item, err = _get_timeline_item(track_type, track_index, item_index)
     if err:
         return err
-    return {"success": bool(item.ClearFlags(color))}
+    # Resolve clears every flag only with "All"; "" returns False (measured on 21.1.1).
+    return {"success": bool(item.ClearFlags(color or "All"))}
 
 
 @mcp.tool()
@@ -1933,8 +1934,12 @@ def ti_get_takes_info(item_index: int = 0, track_type: str = "video", track_inde
     selected = item.GetSelectedTakeIndex()
     takes = []
     for i in range(count):
-        take = item.GetTakeByIndex(i + 1)
-        takes.append(take if take else {})
+        take = dict(item.GetTakeByIndex(i + 1) or {})
+        mpi = take.get("mediaPoolItem")
+        if mpi is not None and not isinstance(mpi, (str, int, float, dict)):
+            # Raw MediaPoolItem proxies are not JSON-serializable.
+            take["mediaPoolItem"] = {"name": mpi.GetName(), "id": mpi.GetUniqueId()}
+        takes.append(take)
     return {"takes_count": count, "selected_take_index": selected, "takes": takes}
 
 

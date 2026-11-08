@@ -539,7 +539,7 @@ def clear_clip_flags(clip_id: str, color: str = "") -> Dict[str, Any]:
 
     Args:
         clip_id: Unique ID of the clip.
-        color: Specific color to clear, or empty for all colors.
+        color: Specific color to clear, or empty / "All" for all colors.
     """
     _, mp, err = _get_mp()
     if err:
@@ -547,7 +547,8 @@ def clear_clip_flags(clip_id: str, color: str = "") -> Dict[str, Any]:
     clip = _find_clip_by_id(mp.GetRootFolder(), clip_id)
     if not clip:
         return {"error": f"Clip {clip_id} not found"}
-    result = clip.ClearFlags(color)
+    # Resolve clears every flag only with "All"; "" returns False (measured on 21.1.1).
+    result = clip.ClearFlags(color or "All")
     return {"success": bool(result)}
 
 

@@ -20,41 +20,33 @@ logger = logging.getLogger("davinci-resolve-mcp.project_properties")
 
 # Common project properties with their types
 PROJECT_PROPERTY_TYPES = {
+    # Types of the values Resolve RETURNS from GetSetting (DaVinciResolveScript.pyi,
+    # Resolve 21.1). SetSetting takes strings for every key here except superScale
+    # (measured live: SetSetting("timelineResolutionWidth", 1920) -> False, "1920" -> True).
     # Timeline settings
     "timelineFrameRate": "float",
     "timelineResolutionWidth": "int",
     "timelineResolutionHeight": "int",
-    "timelineOutputResolutionWidth": "int", 
+    "timelineOutputResolutionWidth": "int",
     "timelineOutputResolutionHeight": "int",
     "timelineInterlaceProcessing": "int",
-    
     # Color settings
-    "colorScienceMode": "int",
-    "timelineColorSpace": "string",
-    "timelineGamma": "string",
-    "inputDRT": "string",
-    "outputDRT": "string",
-    
+    "colorScienceMode": "string",
+    "colorSpaceTimeline": "string",
+    "colorSpaceTimelineGamma": "string",
+    "separateColorSpaceAndGamma": "string",
     # Image processing
-    "superScaleEnabled": "bool",
-    "superScaleQuality": "int",
-    "noiseReductionEnabled": "bool",
-    "noiseReductionMode": "int",
-    "noiseReductionValue": "float",
-    
-    # Format settings
-    "timelineAudioSampleRate": "int",
-    "timelineAudioBitDepth": "int",
-    "mediaPoolRelativePath": "bool",
-    
-    # Cache settings
-    "CacheMode": "int",
-    "CacheClipMode": "int",
-    "OptimizedMediaMode": "int",
-    "ProxyMode": "int",
-    "ProxyQuality": "int",
-    "TimelineCacheMode": "int",
+    "superScale": "int",
+    # Cache / proxy / optimized media
+    "perfRenderCacheMode": "string",
+    "perfOptimisedMediaOn": "string",
+    "perfProxyMediaMode": "string",
+    "perfProxyResolutionRatio": "string",
+    "perfOptimizedResolutionRatio": "string",
 }
+
+# Settings whose SetSetting value must keep a non-string type.
+_NON_STRING_SETTINGS = {"superScale"}
 
 def get_all_project_properties(project_obj) -> Dict[str, Any]:
     """
@@ -155,27 +147,16 @@ def set_project_property(project_obj, property_name: str, property_value: Any) -
         return False
     
     try:
-        # Handle type conversion based on expected property type
-        if property_name in PROJECT_PROPERTY_TYPES:
-            property_type = PROJECT_PROPERTY_TYPES[property_name]
-            
-            if property_type == "int":
-                try:
-                    property_value = int(property_value)
-                except (ValueError, TypeError):
-                    logger.warning(f"Invalid integer value for property {property_name}: {property_value}")
-            
-            elif property_type == "float":
-                try:
-                    property_value = float(property_value)
-                except (ValueError, TypeError):
-                    logger.warning(f"Invalid float value for property {property_name}: {property_value}")
-            
-            elif property_type == "bool":
-                if isinstance(property_value, str):
-                    property_value = property_value.lower() in ("true", "yes", "1", "on")
-                property_value = bool(property_value)
-        
+        # Resolve's SetSetting takes strings ("Set as a string" in the 21.1 stub) for
+        # every documented key except superScale; numbers and bools are refused.
+        if property_name not in _NON_STRING_SETTINGS and not isinstance(property_value, str):
+            if isinstance(property_value, bool):
+                property_value = "1" if property_value else "0"
+            elif isinstance(property_value, float) and property_value.is_integer():
+                property_value = str(int(property_value))
+            else:
+                property_value = str(property_value)
+
         # Set the property
         return project_obj.SetSetting(property_name, property_value)
         
@@ -311,29 +292,14 @@ def get_superscale_settings(project_obj) -> Dict[str, Any]:
         # Get SuperScale settings
         settings = {}
         
-        # Check if SuperScale is enabled
-        superscale_enabled = get_project_property(project_obj, "superScaleEnabled")
-        settings["enabled"] = bool(superscale_enabled)
-        
-        # Get quality setting
-        quality = get_project_property(project_obj, "superScaleQuality")
-        settings["quality"] = quality
-        
-        # Translate quality number to descriptive name
-        quality_names = {
-            0: "Auto",
-            1: "Better Quality",  # Sharper but might have artifacts
-            2: "Smoother",        # Less sharp but fewer artifacts
-        }
-        
-        if quality in quality_names:
-            settings["qualityName"] = quality_names[quality]
-        
-        # Add additional SuperScale properties if available
-        for prop in ["superScaleOverrideWidth", "superScaleOverrideHeight"]:
-            value = get_project_property(project_obj, prop)
-            if value is not None:
-                settings[prop] = value
+        value = project_obj.GetSetting("superScale")
+        settings["superScale"] = value
+        settings["enabled"] = value not in (1, None)
+        settings["scaleName"] = {0: "Auto", 1: "none", 2: "2x", 3: "3x", 4: "4x"}.get(value, "unknown")
+        for prop in ["superScaleSharpness", "superScaleNoiseReduction"]:
+            v = project_obj.GetSetting(prop)
+            if v is not None:
+                settings[prop] = v
         
         return settings
         
@@ -342,42 +308,23 @@ def get_superscale_settings(project_obj) -> Dict[str, Any]:
         return {"error": f"Error getting SuperScale settings: {str(e)}"}
 
 def set_superscale_settings(project_obj, enabled: bool, quality: int = 0) -> bool:
-    """
-    Set SuperScale settings for the project.
-    
-    Args:
-        project_obj: Project object from DaVinci Resolve API
-        enabled: Whether SuperScale is enabled
-        quality: SuperScale quality (0=Auto, 1=Better Quality, 2=Smoother)
-        
-    Returns:
-        True if successful, False otherwise
+    """Set the project SuperScale multiplier (native ``superScale``, an int).
+
+    Resolve 21.1 values: 0=Auto, 1=none, 2=2x, 3=3x, 4=4x. ``enabled=False`` writes 1.
+    ``quality`` is the multiplier to apply when enabled (0, 2, 3 or 4); the older
+    0/1/2 "quality" meaning never existed as a Resolve setting.
     """
     if project_obj is None:
         return False
-    
+    value = int(quality) if enabled else 1
+    if enabled and value not in (0, 2, 3, 4):
+        return False
     try:
-        # Validate quality value
-        if quality not in [0, 1, 2]:
-            logger.warning(f"Invalid SuperScale quality value: {quality}. Using 0 (Auto)")
-            quality = 0
-        
-        # Set SuperScale properties
-        success = True
-        
-        # Set enabled state
-        if not set_project_property(project_obj, "superScaleEnabled", enabled):
-            success = False
-        
-        # Set quality
-        if not set_project_property(project_obj, "superScaleQuality", quality):
-            success = False
-        
-        return success
-        
+        return bool(project_obj.SetSetting("superScale", value)) and project_obj.GetSetting("superScale") == value
     except Exception as e:
         logger.error(f"Error setting SuperScale settings: {str(e)}")
         return False
+
 
 def get_color_settings(project_obj) -> Dict[str, Any]:
     """
@@ -397,10 +344,9 @@ def get_color_settings(project_obj) -> Dict[str, Any]:
         settings = {}
         color_properties = [
             "colorScienceMode",
-            "timelineColorSpace",
-            "timelineGamma",
-            "inputDRT",
-            "outputDRT"
+            "colorSpaceTimeline",
+            "colorSpaceTimelineGamma",
+            "separateColorSpaceAndGamma",
         ]
         
         for prop in color_properties:
@@ -412,9 +358,11 @@ def get_color_settings(project_obj) -> Dict[str, Any]:
         if "colorScienceMode" in settings:
             mode = settings["colorScienceMode"]
             mode_names = {
-                0: "DaVinci YRGB",
-                1: "DaVinci YRGB Color Managed",
-                2: "ACEScct"
+                "davinciYRGB": "DaVinci YRGB",
+                "davinciYRGBColorManaged": "DaVinci YRGB Color Managed (legacy)",
+                "davinciYRGBColorManagedv2": "DaVinci YRGB Color Managed",
+                "acescc": "ACEScc",
+                "acescct": "ACEScct",
             }
             
             if mode in mode_names:
@@ -426,82 +374,54 @@ def get_color_settings(project_obj) -> Dict[str, Any]:
         logger.error(f"Error getting color settings: {str(e)}")
         return {"error": f"Error getting color settings: {str(e)}"}
 
+COLOR_SCIENCE_MODES = {
+    # aliases accepted by this server -> native colorScienceMode values (21.1 stub)
+    "YRGB": "davinciYRGB",
+    "DaVinci YRGB": "davinciYRGB",
+    "YRGB Color Managed": "davinciYRGBColorManagedv2",
+    "DaVinci YRGB Color Managed": "davinciYRGBColorManagedv2",
+    "ACEScct": "acescct",
+    "ACEScc": "acescc",
+    "ACES": "acescct",
+}
+NATIVE_COLOR_SCIENCE_MODES = ("davinciYRGB", "davinciYRGBColorManaged",
+                              "davinciYRGBColorManagedv2", "acescc", "acescct")
+
+
 def set_color_science_mode(project_obj, mode: str) -> bool:
-    """
-    Set color science mode for the project.
-    
-    Args:
-        project_obj: Project object from DaVinci Resolve API
-        mode: Color science mode ('YRGB', 'YRGB Color Managed', 'ACEScct', or numeric value)
-        
-    Returns:
-        True if successful, False otherwise
-    """
+    """Set color science mode. Accepts native values or the aliases in COLOR_SCIENCE_MODES."""
     if project_obj is None:
         return False
-    
+    native = mode if mode in NATIVE_COLOR_SCIENCE_MODES else COLOR_SCIENCE_MODES.get(str(mode))
+    if native is None:
+        logger.error(f"Invalid color science mode: {mode}")
+        return False
     try:
-        # Map string modes to numeric values
-        mode_values = {
-            "YRGB": 0,
-            "DaVinci YRGB": 0,
-            "YRGB Color Managed": 1,
-            "DaVinci YRGB Color Managed": 1,
-            "ACEScct": 2,
-            "ACES": 2
-        }
-        
-        # Get numeric value
-        mode_value = None
-        
-        if isinstance(mode, int) and 0 <= mode <= 2:
-            mode_value = mode
-        elif isinstance(mode, str):
-            mode_value = mode_values.get(mode)
-        
-        if mode_value is None:
-            logger.error(f"Invalid color science mode: {mode}")
-            return False
-        
-        # Set the color science mode
-        return set_project_property(project_obj, "colorScienceMode", mode_value)
-        
+        return bool(project_obj.SetSetting("colorScienceMode", native)) and project_obj.GetSetting("colorScienceMode") == native
     except Exception as e:
         logger.error(f"Error setting color science mode: {str(e)}")
         return False
 
+
 def set_color_space(project_obj, color_space: str, gamma: str = None) -> bool:
-    """
-    Set timeline color space and gamma.
-    
-    Args:
-        project_obj: Project object from DaVinci Resolve API
-        color_space: Timeline color space (e.g., 'Rec.709', 'DCI-P3 D65', 'Rec.2020')
-        gamma: Timeline gamma (e.g., 'Rec.709 Gamma', 'Gamma 2.4')
-        
-    Returns:
-        True if successful, False otherwise
-    """
+    """Set timeline color space (``colorSpaceTimeline``) and optional gamma
+    (``colorSpaceTimelineGamma``, which needs ``separateColorSpaceAndGamma`` = '1').
+    Values are the names shown in Project Settings, e.g. 'Rec.709 (Scene)'."""
     if project_obj is None:
         return False
-    
     try:
-        success = True
-        
-        # Set timeline color space
-        if not set_project_property(project_obj, "timelineColorSpace", color_space):
-            success = False
-        
-        # Set gamma if provided
         if gamma is not None:
-            if not set_project_property(project_obj, "timelineGamma", gamma):
-                success = False
-        
-        return success
-        
+            if not project_obj.SetSetting("separateColorSpaceAndGamma", "1"):
+                return False
+        if not project_obj.SetSetting("colorSpaceTimeline", str(color_space)):
+            return False
+        if gamma is not None and not project_obj.SetSetting("colorSpaceTimelineGamma", str(gamma)):
+            return False
+        return True
     except Exception as e:
         logger.error(f"Error setting color space: {str(e)}")
         return False
+
 
 def get_project_metadata(project_obj) -> Dict[str, Any]:
     """
